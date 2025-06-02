@@ -137,11 +137,23 @@ export function fromClashConfig(clashConfig) {
 
   if (typeof clashConfig === 'string') {
     try {
+      console.log(`🔍 开始解析 YAML 字符串 (${clashConfig.length} 字符)`);
+      const startTime = Date.now();
+
       // 如果是 YAML 字符串，需要解析
-      // 这里简化处理，实际应该使用 YAML 解析库
       config = parseYamlString(clashConfig);
+
+      const parseTime = Date.now() - startTime;
+      console.log(`⚡ YAML 解析完成，耗时 ${parseTime}ms`);
+
+      if (config && config.proxies) {
+        console.log(`🎯 发现 ${config.proxies.length} 个代理节点`);
+      } else {
+        console.warn('⚠️ YAML 解析成功但未找到 proxies 数组');
+      }
     } catch (error) {
-      console.error('解析 Clash YAML 配置失败:', error);
+      console.error('❌ 解析 Clash YAML 配置失败:', error.message);
+      console.error('📄 输入内容预览:', clashConfig.substring(0, 200) + '...');
       return [];
     }
   } else {
@@ -150,13 +162,29 @@ export function fromClashConfig(clashConfig) {
 
   const nodes = [];
 
-  if (config.proxies && Array.isArray(config.proxies)) {
-    for (const clashNode of config.proxies) {
-      const node = fromClashFormat(clashNode);
-      if (node) {
-        nodes.push(node);
+  if (config && config.proxies && Array.isArray(config.proxies)) {
+    console.log(`🔄 开始转换 ${config.proxies.length} 个节点...`);
+
+    for (let i = 0; i < config.proxies.length; i++) {
+      const clashNode = config.proxies[i];
+      try {
+        const node = fromClashFormat(clashNode);
+        if (node) {
+          nodes.push(node);
+        }
+      } catch (error) {
+        console.warn(`⚠️ 节点 ${i + 1} 转换失败:`, error.message);
+      }
+
+      // 每1000个节点显示一次进度
+      if ((i + 1) % 1000 === 0) {
+        console.log(`📊 已处理 ${i + 1}/${config.proxies.length} 个节点`);
       }
     }
+
+    console.log(`✅ 节点转换完成: ${config.proxies.length} → ${nodes.length} (成功率: ${((nodes.length / config.proxies.length) * 100).toFixed(1)}%)`);
+  } else {
+    console.warn('⚠️ 配置中未找到有效的 proxies 数组');
   }
 
   return nodes;
@@ -242,11 +270,18 @@ export function toSimpleClashYaml(nodes, options = {}) {
   const clashNodes = [];
 
   for (const node of nodes) {
-    const clashNode = toClashFormat(node);
-    if (clashNode) {
-      // 添加源格式信息
-      clashNode._sourceFormat = node._sourceFormat || sourceFormat;
-      clashNodes.push(clashNode);
+    try {
+      const clashNode = toClashFormat(node);
+      if (clashNode) {
+        // 添加源格式信息
+        clashNode._sourceFormat = node._sourceFormat || sourceFormat;
+        clashNodes.push(clashNode);
+      } else {
+        console.warn(`⚠️ 跳过无法转换的节点: ${node.name || node.server || 'Unknown'} (${node.type || 'Unknown type'})`);
+      }
+    } catch (error) {
+      console.error(`❌ 转换节点失败: ${node.name || node.server || 'Unknown'}`, error.message);
+      // 继续处理其他节点，不中断整个过程
     }
   }
 
@@ -481,10 +516,40 @@ function preprocessYamlString(yamlString) {
  */
 function parseYamlString(yamlString) {
   try {
+    console.log(`🔧 开始预处理 YAML 字符串...`);
+
     // 预处理 YAML 字符串
     const processedYaml = preprocessYamlString(yamlString);
-    return yaml.load(processedYaml);
+
+    console.log(`🔧 预处理完成，开始 js-yaml 解析...`);
+
+    // 使用 js-yaml 解析，配置选项以处理大文件
+    const config = yaml.load(processedYaml, {
+      schema: yaml.DEFAULT_SCHEMA,
+      json: false,
+      // 增加解析选项以处理大文件
+      onWarning: (warning) => {
+        console.warn(`⚠️ YAML 解析警告:`, warning.message);
+      }
+    });
+
+    if (!config) {
+      throw new Error('YAML 解析结果为空');
+    }
+
+    console.log(`✅ js-yaml 解析成功`);
+    return config;
   } catch (error) {
+    console.error(`❌ YAML 解析失败:`, error.message);
+
+    // 提供更详细的错误信息
+    if (error.mark) {
+      console.error(`📍 错误位置: 行 ${error.mark.line + 1}, 列 ${error.mark.column + 1}`);
+      if (error.mark.get_snippet) {
+        console.error(`📄 错误上下文: ${error.mark.get_snippet()}`);
+      }
+    }
+
     throw new Error(`YAML 解析失败: ${error.message}`);
   }
 }

@@ -72,10 +72,21 @@ export function displayNodeStats(stats) {
  * @param {Object} stats - 统计信息对象
  */
 export function displayMergeStats(stats) {
+  if (!stats) {
+    console.log('\n📊 合并后统计: 统计信息不可用');
+    return;
+  }
+
   console.log('\n📊 合并后统计:');
-  console.log(`  总数: ${stats.total}`);
-  console.log(`  协议分布: ${Object.entries(stats.types).map(([type, count]) => `${type}(${count})`).join(', ')}`);
-  console.log(`  地区分布: ${Object.entries(stats.regions).map(([region, count]) => `${region}(${count})`).join(', ')}`);
+  console.log(`  总数: ${stats.total || 0}`);
+
+  if (stats.types && Object.keys(stats.types).length > 0) {
+    console.log(`  协议分布: ${Object.entries(stats.types).map(([type, count]) => `${type}(${count})`).join(', ')}`);
+  }
+
+  if (stats.regions && Object.keys(stats.regions).length > 0) {
+    console.log(`  地区分布: ${Object.entries(stats.regions).map(([region, count]) => `${region}(${count})`).join(', ')}`);
+  }
 }
 
 /**
@@ -173,14 +184,7 @@ export function formatFileSize(bytes) {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
-/**
- * 延迟函数
- * @param {number} ms - 延迟毫秒数
- * @returns {Promise} Promise对象
- */
-export function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+// delay函数已移至 utils/index.js 中，避免重复定义
 
 /**
  * 检查是否为IPv4地址

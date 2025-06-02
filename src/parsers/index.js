@@ -303,8 +303,8 @@ export { UniversalParser, universalParser } from './universal.js';
  * @param {string} content - 输入内容
  * @returns {Object} 解析结果
  */
-export function smartParseContent(content) {
-  const { universalParser } = require('./universal.js');
+export async function smartParseContent(content) {
+  const { universalParser } = await import('./universal.js');
   return universalParser.smartParse(content);
 }
 

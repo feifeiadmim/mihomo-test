@@ -7,21 +7,18 @@
 
 import fs from 'fs';
 import path from 'path';
-import { ProxyConverter } from './src/index.js';
 import { OutputFormats } from './src/types.js';
 
 import {
   displayProcessProgress,
-  displayMergeStats,
-  displayDeduplicationResult,
-  validateNodes
+  displayMergeStats
 } from './src/utils/common.js';
-import { generateOutputFiles } from './src/utils/output.js';
 import { CONFIG } from './src/config/default.js';
-import { FileProcessError, defaultErrorHandler } from './src/utils/errors.js';
+import { ParserErrorHandler } from './src/parsers/common/error-handler.js';
+import { CommonFileProcessor } from './src/parsers/common/file-processor.js';
 
 // 使用统一配置
-const MERGE_CONFIG = CONFIG.mergeConfig;
+const MERGE_CONFIG = CONFIG;
 
 /**
  * 确保输出目录存在
@@ -121,180 +118,115 @@ function scanAndCategorizeFiles() {
 
 
 /**
- * 合并YAML文件
+ * 通用文件合并函数（重构版本 - 消除重复逻辑）
+ * @param {Array} files - 文件信息数组
+ * @param {string} fileType - 文件类型名称
+ * @param {string} parseFormat - 解析格式
+ * @param {string} outputPrefix - 输出文件前缀
+ * @param {Object} customDeduplicationConfig - 自定义去重配置
+ * @param {Array} outputFormats - 输出格式数组
+ */
+async function mergeFilesCommon(files, fileType, parseFormat, outputPrefix, customDeduplicationConfig = null, outputFormats = []) {
+  displayProcessProgress(`${fileType}文件`, '合并');
+
+  if (files.length === 0) {
+    console.log(`⚠️ 没有找到${fileType}文件`);
+    return;
+  }
+
+  // 显示要处理的文件列表
+  console.log(`📋 准备处理 ${files.length} 个${fileType}文件:`);
+  files.forEach((fileInfo, index) => {
+    console.log(`  ${index + 1}. ${fileInfo.file}`);
+  });
+  console.log('');
+
+  try {
+    const processor = new CommonFileProcessor({
+      enableValidation: true,
+      enableStats: true,
+      enableProgress: true
+    });
+
+    let allNodes = [];
+
+    // 处理每个文件
+    for (const fileInfo of files) {
+      console.log(`📁 处理: ${fileInfo.file}`);
+      try {
+        const nodes = await processor.parseNodes(fileInfo.content, parseFormat);
+        console.log(`  ✅ 解析到 ${nodes.length} 个节点`);
+        allNodes = allNodes.concat(nodes);
+      } catch (error) {
+        console.error(`  ❌ 解析失败:`, error.message);
+      }
+    }
+
+    if (allNodes.length === 0) {
+      console.log('⚠️ 没有解析到任何节点');
+      return;
+    }
+
+    console.log(`\n🔄 处理合并的节点 (总计: ${allNodes.length})`);
+
+    // 验证节点
+    processor.validateNodes(allNodes);
+
+    // 处理节点（去重、重命名）
+    const processOptions = {
+      ...MERGE_CONFIG.defaultOptions,
+      deduplicateOptions: customDeduplicationConfig || MERGE_CONFIG.defaultOptions.deduplicateOptions
+    };
+
+    const processedNodes = await processor.processNodes(allNodes, processOptions);
+
+    // 安全检查：确保processedNodes是数组
+    if (!processedNodes || !Array.isArray(processedNodes)) {
+      console.error('⚠️ 节点处理失败，返回空数组');
+      return;
+    }
+
+    // 生成统计
+    const stats = processor.generateStats(processedNodes);
+    displayMergeStats(stats);
+
+    // 生成输出文件
+    await processor.generateOutputFiles(processedNodes, outputFormats, outputPrefix, parseFormat);
+
+    console.log(`🎉 ${fileType}文件合并完成！合并了 ${files.length} 个文件，共 ${processedNodes.length} 个节点`);
+
+    // 返回合并结果
+    return {
+      totalNodes: allNodes.length,
+      uniqueNodes: processedNodes.length,
+      duplicateNodes: allNodes.length - processedNodes.length,
+      files: files.length
+    };
+  } catch (error) {
+    ParserErrorHandler.logError('MERGE', 'merge_files', error, { fileType, fileCount: files.length });
+    return null;
+  }
+}
+
+/**
+ * 合并YAML文件（使用通用函数）
  */
 async function mergeYamlFiles(yamlFiles, customDeduplicationConfig = null, outputFormats = [OutputFormats.CLASH]) {
-  displayProcessProgress('YAML文件', '合并');
-
-  if (yamlFiles.length === 0) {
-    console.log('⚠️ 没有找到YAML文件');
-    return;
-  }
-
-  try {
-    const converter = new ProxyConverter();
-    let allNodes = [];
-
-    for (const fileInfo of yamlFiles) {
-      console.log(`📁 处理: ${fileInfo.file}`);
-      try {
-        const nodes = converter.parse(fileInfo.content, OutputFormats.CLASH);
-        console.log(`  ✅ 解析到 ${nodes.length} 个节点`);
-        allNodes = allNodes.concat(nodes);
-      } catch (error) {
-        console.error(`  ❌ 解析失败:`, error.message);
-      }
-    }
-
-    if (allNodes.length === 0) {
-      console.log('⚠️ 没有解析到任何节点');
-      return;
-    }
-
-    console.log(`\n🔄 处理合并的节点 (总计: ${allNodes.length})`);
-
-    // 验证节点
-    validateNodes(allNodes);
-
-    // 去重
-    const originalCount = allNodes.length;
-    const deduplicationOptions = customDeduplicationConfig || MERGE_CONFIG.defaultOptions.deduplicateOptions;
-    allNodes = converter.deduplicate(allNodes, deduplicationOptions);
-    displayDeduplicationResult(originalCount, allNodes.length);
-
-    // 重命名
-    allNodes = converter.rename(allNodes, MERGE_CONFIG.defaultOptions.renameOptions);
-    console.log(`✅ 重命名完成`);
-
-    // 生成统计
-    const stats = converter.getStats(allNodes);
-    displayMergeStats(stats);
-
-    // 生成输出文件
-    await generateOutputFiles(allNodes, outputFormats, 'merged_yaml_nodes', 'yaml');
-
-    console.log(`🎉 YAML文件合并完成！合并了 ${yamlFiles.length} 个文件，共 ${allNodes.length} 个节点`);
-  } catch (error) {
-    defaultErrorHandler.handle(new FileProcessError(`YAML文件合并失败: ${error.message}`, null, { files: yamlFiles.length }));
-  }
+  return mergeFilesCommon(yamlFiles, 'YAML', 'clash', 'merged_yaml_nodes', customDeduplicationConfig, outputFormats);
 }
 
 /**
- * 合并Base64文件
+ * 合并Base64文件（使用通用函数）
  */
 async function mergeBase64Files(base64Files, customDeduplicationConfig = null, outputFormats = [OutputFormats.BASE64]) {
-  displayProcessProgress('Base64文件', '合并');
-
-  if (base64Files.length === 0) {
-    console.log('⚠️ 没有找到Base64文件');
-    return;
-  }
-
-  try {
-    const converter = new ProxyConverter();
-    let allNodes = [];
-
-    for (const fileInfo of base64Files) {
-      console.log(`📁 处理: ${fileInfo.file}`);
-      try {
-        const nodes = converter.parse(fileInfo.content, OutputFormats.BASE64);
-        console.log(`  ✅ 解析到 ${nodes.length} 个节点`);
-        allNodes = allNodes.concat(nodes);
-      } catch (error) {
-        console.error(`  ❌ 解析失败:`, error.message);
-      }
-    }
-
-    if (allNodes.length === 0) {
-      console.log('⚠️ 没有解析到任何节点');
-      return;
-    }
-
-    console.log(`\n🔄 处理合并的节点 (总计: ${allNodes.length})`);
-
-    // 验证节点
-    validateNodes(allNodes);
-
-    // 去重
-    const originalCount = allNodes.length;
-    const deduplicationOptions = customDeduplicationConfig || MERGE_CONFIG.defaultOptions.deduplicateOptions;
-    allNodes = converter.deduplicate(allNodes, deduplicationOptions);
-    displayDeduplicationResult(originalCount, allNodes.length);
-
-    // 重命名
-    allNodes = converter.rename(allNodes, MERGE_CONFIG.defaultOptions.renameOptions);
-    console.log(`✅ 重命名完成`);
-
-    // 生成统计
-    const stats = converter.getStats(allNodes);
-    displayMergeStats(stats);
-
-    // 生成输出文件
-    await generateOutputFiles(allNodes, outputFormats, 'merged_base64_nodes', 'base64');
-
-    console.log(`🎉 Base64文件合并完成！合并了 ${base64Files.length} 个文件，共 ${allNodes.length} 个节点`);
-  } catch (error) {
-    defaultErrorHandler.handle(new FileProcessError(`Base64文件合并失败: ${error.message}`, null, { files: base64Files.length }));
-  }
+  return mergeFilesCommon(base64Files, 'Base64', 'base64', 'merged_base64_nodes', customDeduplicationConfig, outputFormats);
 }
 
 /**
- * 合并URL文件
+ * 合并URL文件（使用通用函数）
  */
 async function mergeUrlFiles(urlFiles, customDeduplicationConfig = null, outputFormats = [OutputFormats.URL]) {
-  displayProcessProgress('URL文件', '合并');
-
-  if (urlFiles.length === 0) {
-    console.log('⚠️ 没有找到URL文件');
-    return;
-  }
-
-  try {
-    const converter = new ProxyConverter();
-    let allNodes = [];
-
-    for (const fileInfo of urlFiles) {
-      console.log(`📁 处理: ${fileInfo.file}`);
-      try {
-        const nodes = converter.parse(fileInfo.content, OutputFormats.URL);
-        console.log(`  ✅ 解析到 ${nodes.length} 个节点`);
-        allNodes = allNodes.concat(nodes);
-      } catch (error) {
-        console.error(`  ❌ 解析失败:`, error.message);
-      }
-    }
-
-    if (allNodes.length === 0) {
-      console.log('⚠️ 没有解析到任何节点');
-      return;
-    }
-
-    console.log(`\n🔄 处理合并的节点 (总计: ${allNodes.length})`);
-
-    // 验证节点
-    validateNodes(allNodes);
-
-    // 去重
-    const originalCount = allNodes.length;
-    const deduplicationOptions = customDeduplicationConfig || MERGE_CONFIG.defaultOptions.deduplicateOptions;
-    allNodes = converter.deduplicate(allNodes, deduplicationOptions);
-    displayDeduplicationResult(originalCount, allNodes.length);
-
-    // 重命名
-    allNodes = converter.rename(allNodes, MERGE_CONFIG.defaultOptions.renameOptions);
-    console.log(`✅ 重命名完成`);
-
-    // 生成统计
-    const stats = converter.getStats(allNodes);
-    displayMergeStats(stats);
-
-    // 生成输出文件
-    await generateOutputFiles(allNodes, outputFormats, 'merged_url_nodes', 'url');
-
-    console.log(`🎉 URL文件合并完成！合并了 ${urlFiles.length} 个文件，共 ${allNodes.length} 个节点`);
-  } catch (error) {
-    defaultErrorHandler.handle(new FileProcessError(`URL文件合并失败: ${error.message}`, null, { files: urlFiles.length }));
-  }
+  return mergeFilesCommon(urlFiles, 'URL', 'url', 'merged_url_nodes', customDeduplicationConfig, outputFormats);
 }
 
 export { mergeYamlFiles, mergeBase64Files, mergeUrlFiles, scanAndCategorizeFiles, ensureOutputDir };

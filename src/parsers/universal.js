@@ -285,7 +285,58 @@ export class UniversalParser {
    * @returns {Object[]} 解析结果
    */
   parseClashYaml(content) {
-    // 简化的 YAML 解析，实际项目中应使用专门的 YAML 库
+    try {
+      // 使用专业的 js-yaml 库进行解析
+      const yaml = require('js-yaml');
+
+      // 预处理 YAML 字符串，移除不支持的标签
+      const processedContent = this.preprocessYamlString(content);
+
+      // 解析 YAML
+      const config = yaml.load(processedContent, {
+        // 配置选项以处理大文件
+        schema: yaml.DEFAULT_SCHEMA,
+        json: false
+      });
+
+      // 提取 proxies 数组
+      if (config && config.proxies && Array.isArray(config.proxies)) {
+        console.log(`🎯 使用 js-yaml 成功解析 ${config.proxies.length} 个节点`);
+        return config.proxies;
+      }
+
+      console.warn('⚠️ YAML 文件中未找到 proxies 数组');
+      return [];
+
+    } catch (yamlError) {
+      console.warn('⚠️ js-yaml 解析失败，回退到手工解析:', yamlError.message);
+
+      // 回退到手工解析（保留原有逻辑作为备用）
+      return this.parseClashYamlManual(content);
+    }
+  }
+
+  /**
+   * 预处理 YAML 字符串，移除不支持的标签
+   * @param {string} yamlString - 原始 YAML 字符串
+   * @returns {string} 处理后的 YAML 字符串
+   */
+  preprocessYamlString(yamlString) {
+    // 移除 !<str> 标签，保留值
+    let processed = yamlString.replace(/!<str>\s+/g, '');
+
+    // 移除其他可能的自定义标签
+    processed = processed.replace(/!<[^>]+>\s+/g, '');
+
+    return processed;
+  }
+
+  /**
+   * 手工解析 Clash YAML 格式（备用方法）
+   * @param {string} content - YAML 内容
+   * @returns {Object[]} 解析结果
+   */
+  parseClashYamlManual(content) {
     const lines = content.split('\n');
     const nodes = [];
     let inProxies = false;
@@ -293,7 +344,7 @@ export class UniversalParser {
 
     for (const line of lines) {
       const trimmed = line.trim();
-      
+
       if (trimmed === 'proxies:') {
         inProxies = true;
         continue;
@@ -319,6 +370,7 @@ export class UniversalParser {
       nodes.push(currentProxy);
     }
 
+    console.log(`🔧 手工解析完成，解析到 ${nodes.length} 个节点`);
     return nodes;
   }
 

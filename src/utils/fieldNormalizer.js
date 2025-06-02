@@ -10,23 +10,23 @@ const FIELD_MAPPINGS = {
   // VMess字段
   'alter-id': 'alterId',
   'alter_id': 'alterId',
-  
+
   // TLS字段
   'skip-cert-verify': 'skipCertVerify',
   'skip_cert_verify': 'skipCertVerify',
   'cert-verify': 'skipCertVerify',
   'cert_verify': 'skipCertVerify',
-  
+
   // Hysteria2字段
   'obfs-password': 'obfsPassword',
   'obfs_password': 'obfsPassword',
-  
+
   // SSR字段
   'protocol-param': 'protocolParam',
   'protocol_param': 'protocolParam',
   'obfs-param': 'obfsParam',
   'obfs_param': 'obfsParam',
-  
+
   // 传输层字段
   'grpc-service-name': 'grpcServiceName',
   'grpc_service_name': 'grpcServiceName',
@@ -128,7 +128,7 @@ export function normalizeNodeFields(node) {
     normalizeField(normalized.tls, 'enabled', 'enabled', normalizeBooleanValue);
     normalizeField(normalized.tls, 'skipCertVerify', 'skipCertVerify', normalizeBooleanValue);
     normalizeField(normalized.tls, 'serverName', 'serverName', normalizeStringValue);
-    
+
     // 处理字段别名
     if ('skip-cert-verify' in normalized.tls) {
       normalized.tls.skipCertVerify = normalizeBooleanValue(normalized.tls['skip-cert-verify']);
@@ -154,7 +154,7 @@ export function normalizeNodeFields(node) {
       if (normalized.obfs && typeof normalized.obfs === 'object') {
         normalizeField(normalized.obfs, 'type', 'type', normalizeStringValue);
         normalizeField(normalized.obfs, 'password', 'password', normalizeStringValue);
-        
+
         // 处理字段别名
         if ('obfs-password' in normalized.obfs) {
           normalized.obfs.password = normalizeStringValue(normalized.obfs['obfs-password']);
@@ -180,7 +180,7 @@ export function normalizeNodeFields(node) {
     normalizeField(normalized.transport, 'path', 'path', normalizeStringValue);
     normalizeField(normalized.transport, 'host', 'host', normalizeStringValue);
     normalizeField(normalized.transport, 'serviceName', 'serviceName', normalizeStringValue);
-    
+
     // 处理字段别名
     if ('grpc-service-name' in normalized.transport) {
       normalized.transport.serviceName = normalizeStringValue(normalized.transport['grpc-service-name']);
@@ -191,93 +191,5 @@ export function normalizeNodeFields(node) {
   return normalized;
 }
 
-/**
- * 批量标准化节点列表
- * @param {Array} nodes - 节点列表
- * @returns {Array} 标准化后的节点列表
- */
-export function normalizeNodeList(nodes) {
-  if (!Array.isArray(nodes)) {
-    return nodes;
-  }
-
-  return nodes.map(node => normalizeNodeFields(node));
-}
-
-/**
- * 检查两个值是否在标准化后相等
- * @param {any} value1 - 值1
- * @param {any} value2 - 值2
- * @param {string} type - 值类型 ('boolean', 'number', 'string')
- * @returns {boolean} 是否相等
- */
-export function isNormalizedEqual(value1, value2, type = 'string') {
-  switch (type) {
-    case 'boolean':
-      return normalizeBooleanValue(value1) === normalizeBooleanValue(value2);
-    case 'number':
-      return normalizeNumberValue(value1) === normalizeNumberValue(value2);
-    case 'string':
-    default:
-      return normalizeStringValue(value1) === normalizeStringValue(value2);
-  }
-}
-
-/**
- * 获取标准化的字段值
- * @param {Object} obj - 对象
- * @param {string|Array} fieldPath - 字段路径，支持多个别名
- * @param {any} defaultValue - 默认值
- * @param {string} type - 值类型
- * @returns {any} 标准化后的值
- */
-export function getNormalizedField(obj, fieldPath, defaultValue = '', type = 'string') {
-  if (!obj || typeof obj !== 'object') {
-    return defaultValue;
-  }
-
-  const paths = Array.isArray(fieldPath) ? fieldPath : [fieldPath];
-  
-  for (const path of paths) {
-    if (path.includes('.')) {
-      // 支持嵌套字段访问，如 'tls.enabled'
-      const parts = path.split('.');
-      let value = obj;
-      for (const part of parts) {
-        if (value && typeof value === 'object' && part in value) {
-          value = value[part];
-        } else {
-          value = undefined;
-          break;
-        }
-      }
-      if (value !== undefined) {
-        switch (type) {
-          case 'boolean':
-            return normalizeBooleanValue(value);
-          case 'number':
-            return normalizeNumberValue(value, defaultValue);
-          case 'string':
-          default:
-            return normalizeStringValue(value, defaultValue);
-        }
-      }
-    } else {
-      // 简单字段访问
-      if (path in obj) {
-        const value = obj[path];
-        switch (type) {
-          case 'boolean':
-            return normalizeBooleanValue(value);
-          case 'number':
-            return normalizeNumberValue(value, defaultValue);
-          case 'string':
-          default:
-            return normalizeStringValue(value, defaultValue);
-        }
-      }
-    }
-  }
-
-  return defaultValue;
-}
+// 未使用的函数已移除，保留核心标准化功能
+// 如需要批量处理或复杂字段访问，可以在具体使用场景中实现

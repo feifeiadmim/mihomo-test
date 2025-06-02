@@ -1,22 +1,30 @@
 /**
  * Shadowsocks 协议解析器
+ * 已优化：统一错误处理、验证机制、缓存支持
  */
 
 import { ProxyTypes } from '../types.js';
 import { smartUrlDecode, safeBtoa, safeAtob } from '../utils/index.js';
+import { ParserErrorHandler } from './common/error-handler.js';
+import { NodeValidator } from './common/validator.js';
+import { wrapWithCache } from './common/cache.js';
 
 /**
- * 解析 Shadowsocks URL
+ * 解析 Shadowsocks URL（内部实现）
  * 支持格式: ss://base64(method:password)@server:port#name
  * 或: ss://method:password@server:port#name
  * @param {string} url - SS URL
  * @returns {Object|null} 解析后的节点信息
  */
-export function parseShadowsocksUrl(url) {
-  try {
-    if (!url.startsWith('ss://')) {
-      return null;
-    }
+function _parseShadowsocksUrl(url) {
+  // 输入验证
+  if (!url || typeof url !== 'string') {
+    throw new Error('Invalid input: URL must be a non-empty string');
+  }
+
+  if (!url.startsWith('ss://')) {
+    throw new Error('Invalid protocol: URL must start with ss://');
+  }
 
     // 移除协议前缀
     const content = url.slice(5);
@@ -84,73 +92,109 @@ export function parseShadowsocksUrl(url) {
       }
     }
 
-    // 验证解析结果
-    if (!server || !port || !method || password === undefined || password === null) {
-      console.error('SS解析失败 - 缺少必要字段:', { server, port, method, password: password ? '***' : password });
-      return null;
-    }
-
-    return {
-      type: ProxyTypes.SHADOWSOCKS,
-      name: name ? smartUrlDecode(name) : `${server}:${port}`,
-      server: server,
-      port: parseInt(port),
-      password: password,
-      method: method,
-      plugin: null,
-      pluginOpts: null
-    };
-  } catch (error) {
-    console.error('解析 Shadowsocks URL 失败:', error);
-    return null;
+  // 验证解析结果
+  if (!server || !port || !method || (password === undefined || password === null || (typeof password === 'string' && password.trim() === ''))) {
+    throw new Error(`Missing required fields: server=${!!server}, port=${!!port}, method=${!!method}, password=${password !== undefined && password !== null && (typeof password !== 'string' || password.trim() !== '')}`);
   }
+
+  // 构建节点对象
+  const node = {
+    type: ProxyTypes.SHADOWSOCKS,
+    name: name ? smartUrlDecode(name) : `${server}:${port}`,
+    server: server.trim(),
+    port: parseInt(port),
+    password: password,
+    method: method.trim(),
+    plugin: null,
+    pluginOpts: null
+  };
+
+  // 使用统一验证器验证节点
+  const validation = NodeValidator.validateNode(node, 'SHADOWSOCKS');
+  if (!validation.isValid) {
+    throw new Error(`Node validation failed: ${validation.errors.join(', ')}`);
+  }
+
+  return node;
 }
+
+/**
+ * 解析 Shadowsocks URL（带缓存和错误处理）
+ * @param {string} url - SS URL
+ * @returns {Object|null} 解析后的节点信息
+ */
+export const parseShadowsocksUrl = wrapWithCache(
+  (url) => {
+    try {
+      return _parseShadowsocksUrl(url);
+    } catch (error) {
+      return ParserErrorHandler.handleParseError('SHADOWSOCKS', url, error);
+    }
+  },
+  'shadowsocks',
+  { maxSize: 500, ttl: 300000 } // 5分钟缓存
+);
 
 /**
  * 生成 Shadowsocks URL
  * @param {Object} node - 节点信息
- * @returns {string} SS URL
+ * @returns {string|null} SS URL
  */
 export function generateShadowsocksUrl(node) {
   try {
+    // 验证节点
+    const validation = NodeValidator.validateNode(node, 'SHADOWSOCKS');
+    if (!validation.isValid) {
+      throw new Error(`Invalid node: ${validation.errors.join(', ')}`);
+    }
+
     const auth = `${node.method}:${node.password}`;
 
     // 安全的base64编码
     const authBase64 = safeBtoa(auth);
 
-    const name = encodeURIComponent(node.name);
+    const name = encodeURIComponent(node.name || `${node.server}:${node.port}`);
 
     return `ss://${authBase64}@${node.server}:${node.port}#${name}`;
   } catch (error) {
-    console.error('生成 Shadowsocks URL 失败:', error);
-    return null;
+    return ParserErrorHandler.handleConversionError('SHADOWSOCKS', 'generate', node, error);
   }
 }
 
 /**
  * 转换为 Clash 格式
  * @param {Object} node - 节点信息
- * @returns {Object} Clash 格式节点
+ * @returns {Object|null} Clash 格式节点
  */
 export function toClashFormat(node) {
-  const clashNode = {
-    name: node.name,
-    type: 'ss',
-    server: node.server,
-    port: node.port,
-    cipher: node.method,
-    password: node.password
-  };
-
-  // 添加插件支持
-  if (node.plugin) {
-    clashNode.plugin = node.plugin;
-    if (node.pluginOpts) {
-      clashNode['plugin-opts'] = parsePluginOpts(node.pluginOpts);
+  try {
+    // 验证节点
+    const validation = NodeValidator.validateNode(node, 'SHADOWSOCKS');
+    if (!validation.isValid) {
+      throw new Error(`Invalid node: ${validation.errors.join(', ')}`);
     }
-  }
 
-  return clashNode;
+    const clashNode = {
+      name: node.name || `${node.server}:${node.port}`,
+      type: 'ss',
+      server: node.server,
+      port: node.port,
+      cipher: node.method,
+      password: node.password
+    };
+
+    // 添加插件支持
+    if (node.plugin) {
+      clashNode.plugin = node.plugin;
+      if (node.pluginOpts) {
+        clashNode['plugin-opts'] = parsePluginOpts(node.pluginOpts);
+      }
+    }
+
+    return clashNode;
+  } catch (error) {
+    return ParserErrorHandler.handleConversionError('SHADOWSOCKS', 'toClash', node, error);
+  }
 }
 
 /**
@@ -208,17 +252,16 @@ function stringifyPluginOpts(opts) {
 }
 
 /**
- * 验证节点配置
+ * 验证节点配置（使用统一验证器）
  * @param {Object} node - 节点信息
  * @returns {boolean} 是否有效
  */
 export function validateNode(node) {
-  return !!(
-    node.server &&
-    node.port &&
-    node.password &&
-    node.method &&
-    node.port > 0 &&
-    node.port < 65536
-  );
+  try {
+    const validation = NodeValidator.validateNode(node, 'SHADOWSOCKS');
+    return validation.isValid;
+  } catch (error) {
+    ParserErrorHandler.handleValidationError('SHADOWSOCKS', node, error.message);
+    return false;
+  }
 }

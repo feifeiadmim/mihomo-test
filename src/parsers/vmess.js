@@ -1,88 +1,209 @@
 /**
  * VMess 协议解析器
+ * 已优化：统一错误处理、验证机制、缓存支持、传输层处理统一化
  */
 
 import { ProxyTypes } from '../types.js';
 import { safeBtoa, safeAtob } from '../utils/index.js';
-import { CachedParser, globalRegexCache } from '../utils/parser-cache.js';
-import {
-  globalErrorHandler,
-  ParseError,
-  ParseErrorTypes,
-  ValidationRules
-} from '../utils/error-handler.js';
+import { ParserErrorHandler } from './common/error-handler.js';
+import { NodeValidator } from './common/validator.js';
+import { wrapWithCache } from './common/cache.js';
+import { TransportHandler } from './common/transport-handler.js';
 
 /**
- * 解析 VMess URL
- * 支持格式: vmess://base64(json)
+ * VMess输入安全校验函数
  * @param {string} url - VMess URL
- * @returns {Object|null} 解析后的节点信息
+ * @returns {Object} 校验结果 {isValid: boolean, error?: string, base64Content?: string}
  */
-export function parseVMessUrl(url) {
+export function validateVMessInput(url) {
   try {
+    // 基础类型检查
+    if (!url || typeof url !== 'string') {
+      return { isValid: false, error: 'Invalid input: URL must be a non-empty string' };
+    }
+
+    // 协议前缀检查
     if (!url.startsWith('vmess://')) {
-      return null;
+      return { isValid: false, error: 'Invalid protocol: URL must start with vmess://' };
     }
 
-    // 移除协议前缀并解码base64
+    // 提取Base64内容
     const base64Content = url.slice(8);
-    const jsonString = safeAtob(base64Content);
-    const config = JSON.parse(jsonString);
+    if (!base64Content) {
+      return { isValid: false, error: 'Invalid VMess URL: missing base64 content' };
+    }
 
-    const node = {
-      type: ProxyTypes.VMESS,
-      name: config.ps || `${config.add}:${config.port}`,
-      server: config.add,
-      port: parseInt(config.port),
-      uuid: config.id,
-      alterId: parseInt(config.aid) || 0,
-      cipher: config.scy || 'auto',
-      network: config.net || 'tcp',
-      tls: {
-        enabled: config.tls === 'tls' || config.tls === '1' || config.tls === 1 || config.tls === true,
-        serverName: config.sni || config.host || ''
+    // Base64长度限制（≤10KB）
+    if (base64Content.length > 10240) {
+      return { isValid: false, error: 'VMess URL content too long (max 10KB)' };
+    }
+
+    // Base64格式正则验证
+    const base64Regex = /^[A-Za-z0-9+/]*={0,2}$/;
+    if (!base64Regex.test(base64Content)) {
+      return { isValid: false, error: 'Invalid Base64 format' };
+    }
+
+    // 尝试解码Base64
+    let jsonString;
+    try {
+      jsonString = safeAtob(base64Content);
+    } catch (error) {
+      return { isValid: false, error: `Failed to decode base64 content: ${error.message}` };
+    }
+
+    // JSON长度检查（解码后）
+    if (jsonString.length > 20480) { // 20KB限制
+      return { isValid: false, error: 'Decoded JSON content too long (max 20KB)' };
+    }
+
+    // JSON结构校验
+    let config;
+    try {
+      config = JSON.parse(jsonString);
+    } catch (error) {
+      return { isValid: false, error: `Failed to parse JSON config: ${error.message}` };
+    }
+
+    // JSON结构完整性检查
+    if (!config || typeof config !== 'object') {
+      return { isValid: false, error: 'Invalid JSON structure: must be an object' };
+    }
+
+    // 必需字段验证
+    const requiredFields = ['add', 'port', 'id'];
+    for (const field of requiredFields) {
+      if (!config[field]) {
+        return { isValid: false, error: `Missing required field: ${field}` };
       }
+    }
+
+    // 字段类型验证
+    if (typeof config.add !== 'string' || config.add.trim().length === 0) {
+      return { isValid: false, error: 'Invalid server address (add field)' };
+    }
+
+    const port = parseInt(config.port);
+    if (isNaN(port) || port < 1 || port > 65535) {
+      return { isValid: false, error: 'Invalid port number (1-65535)' };
+    }
+
+    if (typeof config.id !== 'string' || config.id.trim().length === 0) {
+      return { isValid: false, error: 'Invalid UUID (id field)' };
+    }
+
+    // UUID格式验证（简化版）
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(config.id.trim())) {
+      return { isValid: false, error: 'Invalid UUID format' };
+    }
+
+    return {
+      isValid: true,
+      base64Content,
+      jsonString,
+      config
     };
-
-    // 添加高级参数支持
-    if (config.alpn) {
-      node.alpn = config.alpn.split(',').map(s => s.trim());
-    }
-
-    if (config.fp) {
-      node['client-fingerprint'] = config.fp;
-    }
-
-    // 处理传输层配置
-    const transport = parseTransport(config);
-    if (Object.keys(transport).length > 0) {
-      node.transport = transport;
-      // 同时支持Clash格式
-      node[`${node.network}-opts`] = transport;
-    }
-
-    return node;
   } catch (error) {
-    console.error('解析 VMess URL 失败:', error);
-    return null;
+    return { isValid: false, error: `Validation error: ${error.message}` };
   }
 }
 
 /**
+ * 解析 VMess URL（内部实现，使用安全校验）
+ * 支持格式: vmess://base64(json)
+ * @param {string} url - VMess URL
+ * @returns {Object|null} 解析后的节点信息
+ */
+function _parseVMessUrl(url) {
+  // 使用安全校验函数
+  const validation = validateVMessInput(url);
+  if (!validation.isValid) {
+    throw new Error(validation.error);
+  }
+
+  const { config } = validation;
+
+  // 构建节点对象
+  const node = {
+    type: ProxyTypes.VMESS,
+    name: config.ps || `${config.add}:${config.port}`,
+    server: config.add.trim(),
+    port: parseInt(config.port),
+    uuid: config.id.trim(),
+    alterId: parseInt(config.aid) || 0,
+    cipher: config.scy || 'auto',
+    network: config.net || 'tcp',
+    tls: {
+      enabled: config.tls === 'tls' || config.tls === '1' || config.tls === 1 || config.tls === true,
+      serverName: config.sni || config.host || ''
+    }
+  };
+
+  // 添加高级参数支持
+  if (config.alpn) {
+    node.alpn = config.alpn.split(',').map(s => s.trim());
+  }
+
+  if (config.fp) {
+    node['client-fingerprint'] = config.fp;
+  }
+
+  // 使用统一传输层处理器
+  const transport = TransportHandler.parseTransportParams(config, config.net || 'tcp', 'json');
+  if (Object.keys(transport).length > 0) {
+    node.transport = transport;
+    // 同时支持Clash格式
+    node[`${node.network}-opts`] = transport;
+  }
+
+  // 使用统一验证器验证节点
+  const nodeValidation = NodeValidator.validateNode(node, 'VMESS');
+  if (!nodeValidation.isValid) {
+    throw new Error(`Node validation failed: ${nodeValidation.errors.join(', ')}`);
+  }
+
+  return node;
+}
+
+/**
+ * 解析 VMess URL（带缓存和错误处理）
+ * @param {string} url - VMess URL
+ * @returns {Object|null} 解析后的节点信息
+ */
+export const parseVMessUrl = wrapWithCache(
+  (url) => {
+    try {
+      return _parseVMessUrl(url);
+    } catch (error) {
+      return ParserErrorHandler.handleParseError('VMESS', url, error);
+    }
+  },
+  'vmess',
+  { maxSize: 500, ttl: 300000 } // 5分钟缓存
+);
+
+/**
  * 生成 VMess URL
  * @param {Object} node - 节点信息
- * @returns {string} VMess URL
+ * @returns {string|null} VMess URL
  */
 export function generateVMessUrl(node) {
   try {
+    // 验证节点
+    const generateValidation = NodeValidator.validateNode(node, 'VMESS');
+    if (!generateValidation.isValid) {
+      throw new Error(`Invalid node: ${generateValidation.errors.join(', ')}`);
+    }
+
     const config = {
       v: '2',
-      ps: node.name,
+      ps: node.name || `${node.server}:${node.port}`,
       add: node.server,
       port: node.port.toString(),
       id: node.uuid,
-      aid: node.alterId.toString(),
-      scy: node.cipher,
+      aid: (node.alterId || 0).toString(),
+      scy: node.cipher || 'auto',
       net: node.network || 'tcp',
       type: 'none',
       host: '',
@@ -100,58 +221,53 @@ export function generateVMessUrl(node) {
       config.fp = node['client-fingerprint'];
     }
 
-    // 处理传输层配置
-    if (node.network && node.network !== 'tcp') {
-      const transportOpts = node[`${node.network}-opts`] || node.transport;
+    // 使用统一传输层处理器处理传输配置
+    if (node.network && node.network !== 'tcp' && node.transport) {
+      const transportOpts = node.transport;
 
       switch (node.network) {
         case 'ws':
-          config.path = transportOpts?.path || '/';
-          config.host = transportOpts?.headers?.Host || '';
+          config.path = transportOpts.path || '/';
+          config.host = transportOpts.headers?.Host || transportOpts.host || '';
           // 支持HTTP Upgrade
-          if (transportOpts?.['v2ray-http-upgrade']) {
+          if (transportOpts['v2ray-http-upgrade']) {
             config.net = 'httpupgrade';
           }
           break;
 
         case 'h2':
-          config.path = Array.isArray(transportOpts?.path) ?
-            transportOpts.path[0] : (transportOpts?.path || '/');
-          config.host = Array.isArray(transportOpts?.host) ?
-            transportOpts.host[0] : (transportOpts?.host || '');
+          config.path = Array.isArray(transportOpts.path) ?
+            transportOpts.path[0] : (transportOpts.path || '/');
+          config.host = Array.isArray(transportOpts.host) ?
+            transportOpts.host[0] : (transportOpts.host || '');
           break;
 
         case 'grpc':
-          config.path = transportOpts?.['grpc-service-name'] ||
-            transportOpts?.serviceName || '';
-          config.type = transportOpts?.['_grpc-type'] ||
-            transportOpts?.mode || 'gun';
-          if (transportOpts?.['_grpc-authority']) {
-            config.host = transportOpts['_grpc-authority'];
+          config.path = transportOpts.serviceName || '';
+          config.type = transportOpts.mode || 'gun';
+          if (transportOpts.authority) {
+            config.host = transportOpts.authority;
           }
           break;
 
         case 'kcp':
-          config.type = transportOpts?.['_kcp-type'] ||
-            transportOpts?.headerType || 'none';
-          config.path = transportOpts?.['_kcp-path'] || '';
-          config.host = transportOpts?.['_kcp-host'] || '';
+          config.type = transportOpts.headerType || 'none';
+          config.path = transportOpts.path || '';
+          config.host = transportOpts.host || '';
           break;
 
         case 'quic':
-          config.type = transportOpts?.['_quic-type'] ||
-            transportOpts?.headerType || 'none';
-          config.path = transportOpts?.['_quic-path'] || '';
-          config.host = transportOpts?.['_quic-host'] || '';
+          config.type = transportOpts.headerType || 'none';
+          config.path = transportOpts.path || '';
+          config.host = transportOpts.host || '';
           break;
 
         case 'http':
           config.net = 'tcp';
           config.type = 'http';
-          config.path = Array.isArray(transportOpts?.path) ?
-            transportOpts.path[0] : (transportOpts?.path || '/');
-          config.host = Array.isArray(transportOpts?.headers?.Host) ?
-            transportOpts.headers.Host[0] : (transportOpts?.headers?.Host || '');
+          config.path = Array.isArray(transportOpts.path) ?
+            transportOpts.path[0] : (transportOpts.path || '/');
+          config.host = transportOpts.headers?.Host || transportOpts.host || '';
           break;
       }
     }
@@ -160,357 +276,113 @@ export function generateVMessUrl(node) {
     const base64Content = safeBtoa(jsonString);
     return `vmess://${base64Content}`;
   } catch (error) {
-    console.error('生成 VMess URL 失败:', error);
-    return null;
+    return ParserErrorHandler.handleConversionError('VMESS', 'generate', node, error);
   }
 }
 
 /**
  * 转换为 Clash 格式
  * @param {Object} node - 节点信息
- * @returns {Object} Clash 格式节点
+ * @returns {Object|null} Clash 格式节点
  */
 export function toClashFormat(node) {
-  const clashNode = {
-    name: node.name,
-    type: 'vmess',
-    server: node.server,
-    port: node.port,
-    uuid: node.uuid,
-    alterId: node.alterId,
-    cipher: node.cipher,
-    network: node.network
-  };
-
-  // TLS 配置
-  if (node.tls?.enabled) {
-    clashNode.tls = true;
-    if (node.tls.serverName) {
-      clashNode.servername = node.tls.serverName;
+  try {
+    // 验证节点
+    const clashValidation = NodeValidator.validateNode(node, 'VMESS');
+    if (!clashValidation.isValid) {
+      throw new Error(`Invalid node: ${clashValidation.errors.join(', ')}`);
     }
-  }
 
-  // 传输层配置
-  if (node.transport) {
-    switch (node.network) {
-      case 'ws':
-        clashNode['ws-opts'] = {
-          path: node.transport.path || '/',
-          headers: node.transport.headers || {}
-        };
-        break;
-      case 'h2':
-        clashNode['h2-opts'] = {
-          host: node.transport.host ? [node.transport.host] : [],
-          path: node.transport.path || '/'
-        };
-        break;
-      case 'grpc':
-        clashNode['grpc-opts'] = {
-          'grpc-service-name': node.transport.serviceName || ''
-        };
-        break;
+    const clashNode = {
+      name: node.name || `${node.server}:${node.port}`,
+      type: 'vmess',
+      server: node.server,
+      port: node.port,
+      uuid: node.uuid,
+      alterId: node.alterId || 0,
+      cipher: node.cipher || 'auto',
+      network: node.network || 'tcp'
+    };
+
+    // TLS 配置
+    if (node.tls?.enabled) {
+      clashNode.tls = true;
+      if (node.tls.serverName) {
+        clashNode.servername = node.tls.serverName;
+      }
     }
-  }
 
-  return clashNode;
+    // 使用统一传输层处理器生成Clash配置
+    if (node.transport && node.network !== 'tcp') {
+      const clashTransport = TransportHandler.toClashFormat(node);
+      Object.assign(clashNode, clashTransport);
+    }
+
+    return clashNode;
+  } catch (error) {
+    return ParserErrorHandler.handleConversionError('VMESS', 'toClash', node, error);
+  }
 }
 
 /**
  * 从 Clash 格式解析
  * @param {Object} clashNode - Clash 格式节点
- * @returns {Object} 标准节点格式
+ * @returns {Object|null} 标准节点格式
  */
 export function fromClashFormat(clashNode) {
-  const node = {
-    type: ProxyTypes.VMESS,
-    name: clashNode.name,
-    server: clashNode.server,
-    port: clashNode.port,
-    uuid: clashNode.uuid,
-    alterId: clashNode.alterId || 0,
-    cipher: clashNode.cipher || 'auto',
-    network: clashNode.network || 'tcp',
-    tls: {
-      enabled: !!clashNode.tls,
-      serverName: clashNode.servername || ''
-    },
-    transport: {}
-  };
+  try {
+    if (!clashNode || typeof clashNode !== 'object') {
+      throw new Error('Invalid Clash node: must be an object');
+    }
 
-  // 解析传输层配置
-  switch (node.network) {
-    case 'ws':
-      if (clashNode['ws-opts']) {
-        node.transport = {
-          path: clashNode['ws-opts'].path || '/',
-          headers: clashNode['ws-opts'].headers || {}
-        };
+    const node = {
+      type: ProxyTypes.VMESS,
+      name: clashNode.name || `${clashNode.server}:${clashNode.port}`,
+      server: clashNode.server,
+      port: clashNode.port,
+      uuid: clashNode.uuid,
+      alterId: clashNode.alterId || 0,
+      cipher: clashNode.cipher || 'auto',
+      network: clashNode.network || 'tcp',
+      tls: {
+        enabled: !!clashNode.tls,
+        serverName: clashNode.servername || ''
       }
-      break;
-    case 'h2':
-      if (clashNode['h2-opts']) {
-        node.transport = {
-          host: clashNode['h2-opts'].host?.[0] || '',
-          path: clashNode['h2-opts'].path || '/'
-        };
+    };
+
+    // 使用统一传输层处理器解析传输配置
+    if (node.network !== 'tcp') {
+      const transport = TransportHandler.fromClashFormat(clashNode, node.network);
+      if (Object.keys(transport).length > 0) {
+        node.transport = transport;
       }
-      break;
-    case 'grpc':
-      if (clashNode['grpc-opts']) {
-        node.transport = {
-          serviceName: clashNode['grpc-opts']['grpc-service-name'] || ''
-        };
-      }
-      break;
+    }
+
+    // 验证解析结果
+    const fromClashValidation = NodeValidator.validateNode(node, 'VMESS');
+    if (!fromClashValidation.isValid) {
+      throw new Error(`Node validation failed: ${fromClashValidation.errors.join(', ')}`);
+    }
+
+    return node;
+  } catch (error) {
+    return ParserErrorHandler.handleConversionError('VMESS', 'fromClash', clashNode, error);
   }
-
-  return node;
 }
 
-/**
- * 解析传输层配置
- * @param {Object} config - VMess 配置
- * @returns {Object} 传输层配置
- */
-function parseTransport(config) {
-  const transport = {};
 
-  switch (config.net) {
-    case 'ws':
-      transport.path = config.path || '/';
-      transport.headers = {};
-      if (config.host) {
-        transport.headers.Host = config.host;
-      }
-      break;
-
-    case 'httpupgrade':
-      // HTTP Upgrade 转换为 WebSocket
-      transport.path = config.path || '/';
-      transport.headers = {};
-      if (config.host) {
-        transport.headers.Host = config.host;
-      }
-      transport['v2ray-http-upgrade'] = true;
-      transport['v2ray-http-upgrade-fast-open'] = true;
-      break;
-
-    case 'h2':
-      transport.host = config.host ? [config.host] : [];
-      transport.path = config.path || '/';
-      break;
-
-    case 'grpc':
-      transport['grpc-service-name'] = config.path || '';
-      transport['_grpc-type'] = config.type || 'gun';
-      if (config.host) {
-        transport['_grpc-authority'] = config.host;
-      }
-      break;
-
-    case 'kcp':
-      transport['_kcp-type'] = config.type || 'none';
-      transport['_kcp-host'] = config.host || '';
-      transport['_kcp-path'] = config.path || '';
-      break;
-
-    case 'quic':
-      transport['_quic-type'] = config.type || 'none';
-      transport['_quic-host'] = config.host || '';
-      transport['_quic-path'] = config.path || '';
-      break;
-
-    case 'tcp':
-      if (config.type === 'http') {
-        // TCP + HTTP 伪装
-        transport.path = config.path ? [config.path] : ['/'];
-        transport.headers = {};
-        if (config.host) {
-          transport.headers.Host = [config.host];
-        }
-      }
-      break;
-  }
-
-  return transport;
-}
 
 /**
- * 验证节点配置
+ * 验证节点配置（使用统一验证器）
  * @param {Object} node - 节点信息
  * @returns {boolean} 是否有效
  */
 export function validateNode(node) {
-  return !!(
-    node.server &&
-    node.port &&
-    node.uuid &&
-    node.port > 0 &&
-    node.port < 65536 &&
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(node.uuid)
-  );
-}
-
-/**
- * 增强的VMess解析器类
- * 集成缓存和错误处理机制
- */
-export class EnhancedVMessParser extends CachedParser {
-  constructor() {
-    super('Enhanced VMess Parser');
-    this.vmessRegex = globalRegexCache.get('^vmess://', 'i');
-  }
-
-  /**
-   * 测试是否为VMess URL
-   */
-  test(url) {
-    return this.vmessRegex.test(url);
-  }
-
-  /**
-   * 实际解析方法
-   */
-  doParse(url) {
-    // 验证URL格式
-    globalErrorHandler.validateUrl(url);
-
-    if (!this.test(url)) {
-      throw new ParseError(
-        ParseErrorTypes.INVALID_FORMAT,
-        'Not a valid VMess URL',
-        { url: url.substring(0, 50) + '...' }
-      );
-    }
-
-    const base64Content = url.slice(8);
-    const jsonString = globalErrorHandler.safeBase64Decode(base64Content);
-    const config = globalErrorHandler.safeJsonParse(jsonString);
-
-    return this.parseVMessConfig(config);
-  }
-
-  /**
-   * 解析VMess配置
-   */
-  parseVMessConfig(config) {
-    // 验证必需字段
-    globalErrorHandler.validateRequiredFields(
-      config,
-      ['add', 'port', 'id'],
-      'VMess config'
-    );
-
-    // 验证字段值
-    const port = globalErrorHandler.smartPortHandling(config.port, 'vmess');
-    globalErrorHandler.validateFieldValue(config.id, 'uuid', ValidationRules.uuid);
-
-    const node = this.acquireObject('node');
-
-    // 基础配置
-    node.type = ProxyTypes.VMESS;
-    node.name = config.ps || `${config.add}:${port}`;
-    node.server = config.add;
-    node.port = port;
-    node.uuid = config.id;
-    node.alterId = parseInt(config.aid) || 0;
-    node.cipher = config.scy || 'auto';
-    node.network = config.net || 'tcp';
-
-    // TLS配置
-    const tlsConfig = this.acquireObject('tls');
-    tlsConfig.enabled = config.tls === 'tls' || config.tls === '1' || config.tls === 1 || config.tls === true;
-    tlsConfig.serverName = config.sni || config.host || '';
-    node.tls = tlsConfig;
-
-    // 高级参数
-    if (config.alpn) {
-      node.alpn = config.alpn.split(',').map(s => s.trim());
-    }
-
-    if (config.fp) {
-      node['client-fingerprint'] = config.fp;
-    }
-
-    // 传输层配置
-    const transport = this.parseTransportConfig(config);
-    if (Object.keys(transport).length > 0) {
-      node.transport = transport;
-      node[`${node.network}-opts`] = transport;
-    }
-
-    return node;
-  }
-
-  /**
-   * 解析传输层配置
-   */
-  parseTransportConfig(config) {
-    const transport = this.acquireObject('transport');
-
-    switch (config.net) {
-      case 'ws':
-        transport.path = config.path || '/';
-        transport.headers = {};
-        if (config.host) {
-          transport.headers.Host = config.host;
-        }
-        break;
-
-      case 'httpupgrade':
-        transport.path = config.path || '/';
-        transport.headers = {};
-        if (config.host) {
-          transport.headers.Host = config.host;
-        }
-        transport['v2ray-http-upgrade'] = true;
-        transport['v2ray-http-upgrade-fast-open'] = true;
-        break;
-
-      case 'h2':
-        transport.host = config.host ? [config.host] : [];
-        transport.path = config.path || '/';
-        break;
-
-      case 'grpc':
-        transport['grpc-service-name'] = config.path || '';
-        transport['_grpc-type'] = config.type || 'gun';
-        if (config.host) {
-          transport['_grpc-authority'] = config.host;
-        }
-        break;
-
-      case 'kcp':
-        transport['_kcp-type'] = config.type || 'none';
-        transport['_kcp-host'] = config.host || '';
-        transport['_kcp-path'] = config.path || '';
-        break;
-
-      case 'quic':
-        transport['_quic-type'] = config.type || 'none';
-        transport['_quic-host'] = config.host || '';
-        transport['_quic-path'] = config.path || '';
-        break;
-
-      case 'tcp':
-        if (config.type === 'http') {
-          transport.path = config.path ? [config.path] : ['/'];
-          transport.headers = {};
-          if (config.host) {
-            transport.headers.Host = [config.host];
-          }
-        }
-        break;
-    }
-
-    return transport;
-  }
-
-  /**
-   * 解析方法（使用缓存）
-   */
-  parse(url) {
-    return this.cachedParse(url);
+  try {
+    const validateValidation = NodeValidator.validateNode(node, 'VMESS');
+    return validateValidation.isValid;
+  } catch (error) {
+    ParserErrorHandler.handleValidationError('VMESS', node, error.message);
+    return false;
   }
 }

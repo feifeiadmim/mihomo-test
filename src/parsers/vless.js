@@ -1,62 +1,121 @@
 /**
  * VLESS 协议解析器
+ * 已优化：统一错误处理、验证机制、缓存支持、传输层处理统一化
  */
 
 import { ProxyTypes } from '../types.js';
+import { ParserErrorHandler } from './common/error-handler.js';
+import { NodeValidator } from './common/validator.js';
+import { wrapWithCache } from './common/cache.js';
+import { TransportHandler } from './common/transport-handler.js';
 
 /**
- * 解析 VLESS URL
+ * 解析 VLESS URL（内部实现）
  * 支持格式: vless://uuid@server:port?params#name
  * @param {string} url - VLESS URL
  * @returns {Object|null} 解析后的节点信息
  */
-export function parseVLESSUrl(url) {
-  try {
-    if (!url.startsWith('vless://')) {
-      return null;
-    }
-
-    const urlObj = new URL(url);
-    const uuid = urlObj.username;
-    const server = urlObj.hostname;
-    const port = parseInt(urlObj.port);
-    const name = decodeURIComponent(urlObj.hash.slice(1)) || `${server}:${port}`;
-
-    const params = new URLSearchParams(urlObj.search);
-
-    return {
-      type: ProxyTypes.VLESS,
-      name: name,
-      server: server,
-      port: port,
-      uuid: uuid,
-      flow: params.get('flow') || '',
-      encryption: params.get('encryption') || 'none',
-      network: params.get('type') || 'tcp',
-      tls: {
-        enabled: params.get('security') === 'tls' || params.get('security') === 'reality',
-        serverName: params.get('sni') || '',
-        alpn: params.get('alpn') ? params.get('alpn').split(',') : [],
-        fingerprint: params.get('fp') || ''
-      },
-      transport: parseTransportParams(params),
-      reality: parseRealityParams(params)
-    };
-  } catch (error) {
-    console.error('解析 VLESS URL 失败:', error);
-    return null;
+function _parseVLESSUrl(url) {
+  // 输入验证
+  if (!url || typeof url !== 'string') {
+    throw new Error('Invalid input: URL must be a non-empty string');
   }
+
+  if (!url.startsWith('vless://')) {
+    throw new Error('Invalid protocol: URL must start with vless://');
+  }
+
+  let urlObj;
+  try {
+    urlObj = new URL(url);
+  } catch (error) {
+    throw new Error(`Invalid URL format: ${error.message}`);
+  }
+
+  const uuid = urlObj.username;
+  const server = urlObj.hostname;
+  const port = parseInt(urlObj.port);
+  const name = urlObj.hash ? decodeURIComponent(urlObj.hash.slice(1)) : `${server}:${port}`;
+
+  // 验证必需字段
+  if (!uuid || !server || !port) {
+    throw new Error('Missing required fields: uuid, server, or port');
+  }
+
+  const params = new URLSearchParams(urlObj.search);
+
+  // 构建节点对象
+  const node = {
+    type: ProxyTypes.VLESS,
+    name: name,
+    server: server.trim(),
+    port: port,
+    uuid: uuid.trim(),
+    flow: params.get('flow') || '',
+    encryption: params.get('encryption') || 'none',
+    network: params.get('type') || 'tcp',
+    tls: {
+      enabled: params.get('security') === 'tls' || params.get('security') === 'reality',
+      serverName: params.get('sni') || '',
+      alpn: params.get('alpn') ? params.get('alpn').split(',').map(s => s.trim()) : [],
+      fingerprint: params.get('fp') || ''
+    }
+  };
+
+  // 使用统一传输层处理器
+  const transport = TransportHandler.parseTransportParams(params, node.network, 'url');
+  if (Object.keys(transport).length > 0) {
+    node.transport = transport;
+  }
+
+  // 解析Reality配置
+  node.reality = {
+    enabled: params.get('security') === 'reality',
+    publicKey: params.get('pbk') || '',
+    shortId: params.get('sid') || '',
+    spiderX: params.get('spx') || ''
+  };
+
+  // 使用统一验证器验证节点
+  const validation = NodeValidator.validateNode(node, 'VLESS');
+  if (!validation.isValid) {
+    throw new Error(`Node validation failed: ${validation.errors.join(', ')}`);
+  }
+
+  return node;
 }
+
+/**
+ * 解析 VLESS URL（带缓存和错误处理）
+ * @param {string} url - VLESS URL
+ * @returns {Object|null} 解析后的节点信息
+ */
+export const parseVLESSUrl = wrapWithCache(
+  (url) => {
+    try {
+      return _parseVLESSUrl(url);
+    } catch (error) {
+      return ParserErrorHandler.handleParseError('VLESS', url, error);
+    }
+  },
+  'vless',
+  { maxSize: 500, ttl: 300000 } // 5分钟缓存
+);
 
 /**
  * 生成 VLESS URL
  * @param {Object} node - 节点信息
- * @returns {string} VLESS URL
+ * @returns {string|null} VLESS URL
  */
 export function generateVLESSUrl(node) {
   try {
-    const url = new URL(`vless://${node.uuid}@${node.server}:${node.port}`);
+    // 验证节点
+    const validation = NodeValidator.validateNode(node, 'VLESS');
+    if (!validation.isValid) {
+      throw new Error(`Invalid node: ${validation.errors.join(', ')}`);
+    }
 
+    const url = new URL(`vless://${node.uuid}@${node.server}:${node.port}`);
     const params = new URLSearchParams();
 
     if (node.flow) params.set('flow', node.flow);
@@ -79,248 +138,140 @@ export function generateVLESSUrl(node) {
       if (node.tls.fingerprint) params.set('fp', node.tls.fingerprint);
     }
 
-    // 传输层配置
-    addTransportParams(params, node);
+    // 使用统一传输层处理器添加传输参数
+    TransportHandler.addTransportParams(params, node);
 
     url.search = params.toString();
-    url.hash = encodeURIComponent(node.name);
+    url.hash = encodeURIComponent(node.name || `${node.server}:${node.port}`);
 
     return url.toString();
   } catch (error) {
-    console.error('生成 VLESS URL 失败:', error);
-    return null;
+    return ParserErrorHandler.handleConversionError('VLESS', 'generate', node, error);
   }
 }
 
 /**
  * 转换为 Clash 格式
  * @param {Object} node - 节点信息
- * @returns {Object} Clash 格式节点
+ * @returns {Object|null} Clash 格式节点
  */
 export function toClashFormat(node) {
-  const clashNode = {
-    name: node.name,
-    type: 'vless',
-    server: node.server,
-    port: node.port,
-    uuid: node.uuid,
-    network: node.network,
-    flow: node.flow || ''
-  };
-
-  // TLS 配置
-  if (node.tls?.enabled) {
-    clashNode.tls = true;
-    if (node.tls.serverName) {
-      clashNode.servername = node.tls.serverName;
+  try {
+    // 验证节点
+    const validation = NodeValidator.validateNode(node, 'VLESS');
+    if (!validation.isValid) {
+      throw new Error(`Invalid node: ${validation.errors.join(', ')}`);
     }
-    if (node.tls.alpn?.length) {
-      clashNode.alpn = node.tls.alpn;
-    }
-  }
 
-  // Reality 配置
-  if (node.reality?.enabled) {
-    clashNode.reality = {
-      enabled: true,
-      'public-key': node.reality.publicKey,
-      'short-id': node.reality.shortId
+    const clashNode = {
+      name: node.name || `${node.server}:${node.port}`,
+      type: 'vless',
+      server: node.server,
+      port: node.port,
+      uuid: node.uuid,
+      network: node.network || 'tcp',
+      flow: node.flow || ''
     };
+
+    // TLS 配置
+    if (node.tls?.enabled) {
+      clashNode.tls = true;
+      if (node.tls.serverName) {
+        clashNode.servername = node.tls.serverName;
+      }
+      if (node.tls.alpn?.length) {
+        clashNode.alpn = node.tls.alpn;
+      }
+      if (node.tls.fingerprint) {
+        clashNode['client-fingerprint'] = node.tls.fingerprint;
+      }
+    }
+
+    // Reality 配置
+    if (node.reality?.enabled) {
+      clashNode.reality = {
+        enabled: true,
+        'public-key': node.reality.publicKey,
+        'short-id': node.reality.shortId
+      };
+    }
+
+    // 使用统一传输层处理器生成Clash配置
+    if (node.transport && node.network !== 'tcp') {
+      const clashTransport = TransportHandler.toClashFormat(node);
+      Object.assign(clashNode, clashTransport);
+    }
+
+    return clashNode;
+  } catch (error) {
+    return ParserErrorHandler.handleConversionError('VLESS', 'toClash', node, error);
   }
-
-  // 传输层配置
-  addClashTransportConfig(clashNode, node);
-
-  return clashNode;
 }
 
 /**
  * 从 Clash 格式解析
  * @param {Object} clashNode - Clash 格式节点
- * @returns {Object} 标准节点格式
+ * @returns {Object|null} 标准节点格式
  */
 export function fromClashFormat(clashNode) {
-  const node = {
-    type: ProxyTypes.VLESS,
-    name: clashNode.name,
-    server: clashNode.server,
-    port: clashNode.port,
-    uuid: clashNode.uuid,
-    flow: clashNode.flow || '',
-    encryption: 'none',
-    network: clashNode.network || 'tcp',
-    tls: {
-      enabled: !!clashNode.tls,
-      serverName: clashNode.servername || '',
-      alpn: clashNode.alpn || []
-    },
-    transport: {},
-    reality: {
-      enabled: !!clashNode.reality?.enabled,
-      publicKey: clashNode.reality?.['public-key'] || '',
-      shortId: clashNode.reality?.['short-id'] || ''
+  try {
+    if (!clashNode || typeof clashNode !== 'object') {
+      throw new Error('Invalid Clash node: must be an object');
     }
-  };
 
-  // 解析传输层配置
-  parseClashTransportConfig(node, clashNode);
-
-  return node;
-}
-
-/**
- * 解析传输层参数
- * @param {URLSearchParams} params - URL参数
- * @returns {Object} 传输层配置
- */
-function parseTransportParams(params) {
-  const transport = {};
-  const network = params.get('type') || 'tcp';
-
-  switch (network) {
-    case 'ws':
-      transport.path = params.get('path') || '/';
-      transport.host = params.get('host') || '';
-      break;
-    case 'h2':
-      transport.path = params.get('path') || '/';
-      transport.host = params.get('host') || '';
-      break;
-    case 'grpc':
-      transport.serviceName = params.get('serviceName') || params.get('servicename') || '';
-      transport.mode = params.get('mode') || 'gun';
-      break;
-    case 'tcp':
-      if (params.get('headerType') === 'http') {
-        transport.headerType = 'http';
-        transport.host = params.get('host') || '';
-        transport.path = params.get('path') || '/';
+    const node = {
+      type: ProxyTypes.VLESS,
+      name: clashNode.name || `${clashNode.server}:${clashNode.port}`,
+      server: clashNode.server,
+      port: clashNode.port,
+      uuid: clashNode.uuid,
+      flow: clashNode.flow || '',
+      encryption: 'none',
+      network: clashNode.network || 'tcp',
+      tls: {
+        enabled: !!clashNode.tls,
+        serverName: clashNode.servername || '',
+        alpn: clashNode.alpn || [],
+        fingerprint: clashNode['client-fingerprint'] || ''
+      },
+      reality: {
+        enabled: !!clashNode.reality?.enabled,
+        publicKey: clashNode.reality?.['public-key'] || '',
+        shortId: clashNode.reality?.['short-id'] || ''
       }
-      break;
-  }
+    };
 
-  return transport;
-}
-
-/**
- * 解析 Reality 参数
- * @param {URLSearchParams} params - URL参数
- * @returns {Object} Reality 配置
- */
-function parseRealityParams(params) {
-  return {
-    enabled: params.get('security') === 'reality',
-    publicKey: params.get('pbk') || '',
-    shortId: params.get('sid') || '',
-    spiderX: params.get('spx') || ''
-  };
-}
-
-/**
- * 添加传输层参数到URL
- * @param {URLSearchParams} params - URL参数
- * @param {Object} node - 节点信息
- */
-function addTransportParams(params, node) {
-  if (!node.transport) return;
-
-  switch (node.network) {
-    case 'ws':
-      if (node.transport.path) params.set('path', node.transport.path);
-      if (node.transport.host) params.set('host', node.transport.host);
-      break;
-    case 'h2':
-      if (node.transport.path) params.set('path', node.transport.path);
-      if (node.transport.host) params.set('host', node.transport.host);
-      break;
-    case 'grpc':
-      if (node.transport.serviceName) params.set('servicename', node.transport.serviceName);
-      if (node.transport.mode) params.set('mode', node.transport.mode);
-      break;
-    case 'tcp':
-      if (node.transport.headerType === 'http') {
-        params.set('headerType', 'http');
-        if (node.transport.host) params.set('host', node.transport.host);
-        if (node.transport.path) params.set('path', node.transport.path);
+    // 使用统一传输层处理器解析传输配置
+    if (node.network !== 'tcp') {
+      const transport = TransportHandler.fromClashFormat(clashNode, node.network);
+      if (Object.keys(transport).length > 0) {
+        node.transport = transport;
       }
-      break;
+    }
+
+    // 验证解析结果
+    const validation = NodeValidator.validateNode(node, 'VLESS');
+    if (!validation.isValid) {
+      throw new Error(`Node validation failed: ${validation.errors.join(', ')}`);
+    }
+
+    return node;
+  } catch (error) {
+    return ParserErrorHandler.handleConversionError('VLESS', 'fromClash', clashNode, error);
   }
 }
 
 /**
- * 添加 Clash 传输层配置
- * @param {Object} clashNode - Clash 节点
- * @param {Object} node - 标准节点
- */
-function addClashTransportConfig(clashNode, node) {
-  if (!node.transport) return;
-
-  switch (node.network) {
-    case 'ws':
-      clashNode['ws-opts'] = {
-        path: node.transport.path || '/',
-        headers: node.transport.host ? { Host: node.transport.host } : {}
-      };
-      break;
-    case 'h2':
-      clashNode['h2-opts'] = {
-        host: node.transport.host ? [node.transport.host] : [],
-        path: node.transport.path || '/'
-      };
-      break;
-    case 'grpc':
-      clashNode['grpc-opts'] = {
-        'grpc-service-name': node.transport.serviceName || ''
-      };
-      break;
-  }
-}
-
-/**
- * 解析 Clash 传输层配置
- * @param {Object} node - 标准节点
- * @param {Object} clashNode - Clash 节点
- */
-function parseClashTransportConfig(node, clashNode) {
-  switch (node.network) {
-    case 'ws':
-      if (clashNode['ws-opts']) {
-        node.transport = {
-          path: clashNode['ws-opts'].path || '/',
-          host: clashNode['ws-opts'].headers?.Host || ''
-        };
-      }
-      break;
-    case 'h2':
-      if (clashNode['h2-opts']) {
-        node.transport = {
-          host: clashNode['h2-opts'].host?.[0] || '',
-          path: clashNode['h2-opts'].path || '/'
-        };
-      }
-      break;
-    case 'grpc':
-      if (clashNode['grpc-opts']) {
-        node.transport = {
-          serviceName: clashNode['grpc-opts']['grpc-service-name'] || ''
-        };
-      }
-      break;
-  }
-}
-
-/**
- * 验证节点配置
+ * 验证节点配置（使用统一验证器）
  * @param {Object} node - 节点信息
  * @returns {boolean} 是否有效
  */
 export function validateNode(node) {
-  return !!(
-    node.server &&
-    node.port &&
-    node.uuid &&
-    node.port > 0 &&
-    node.port < 65536 &&
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(node.uuid)
-  );
+  try {
+    const validation = NodeValidator.validateNode(node, 'VLESS');
+    return validation.isValid;
+  } catch (error) {
+    ParserErrorHandler.handleValidationError('VLESS', node, error.message);
+    return false;
+  }
 }

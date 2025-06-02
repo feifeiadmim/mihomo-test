@@ -204,7 +204,7 @@ async function showFileStats() {
 
   const categories = scanAndCategorizeFiles();
 
-  console.log(`📂 扫描目录: ./tests`);
+  console.log(`📂 扫描目录: ./input`);
   console.log('');
   console.log('📋 文件分类统计:');
   console.log(`  🟡 YAML文件: ${categories.yaml.length} 个`);
@@ -407,9 +407,37 @@ async function main() {
   }
 }
 
+/**
+ * 初始化系统
+ */
+async function initializeSystem() {
+  console.log('🔄 正在初始化系统...');
+
+  try {
+    // 预加载并初始化ProxyConverter
+    const { converter } = await import('./src/index.js');
+
+    // 确保标准化输出已初始化
+    if (converter.standardizedOutputPending) {
+      await converter.ensureStandardizedOutput();
+    }
+
+    console.log('✅ 系统初始化完成');
+  } catch (error) {
+    console.warn('⚠️ 系统初始化部分失败，但程序可以继续运行:', error.message);
+  }
+}
+
 // 启动程序
-main().catch(error => {
-  console.error('❌ 程序运行失败:', error);
-  rl.close();
-  process.exit(1);
-});
+async function startApplication() {
+  try {
+    await initializeSystem();
+    await main();
+  } catch (error) {
+    console.error('❌ 程序运行失败:', error);
+    rl.close();
+    process.exit(1);
+  }
+}
+
+startApplication();

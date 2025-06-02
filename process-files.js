@@ -19,7 +19,8 @@ import {
 } from './src/utils/common.js';
 import { generateOutputFiles } from './src/utils/output.js';
 import { CONFIG as DEFAULT_CONFIG } from './src/config/default.js';
-import { FileProcessError, defaultErrorHandler } from './src/utils/errors.js';
+import { ParserErrorHandler, BaseError } from './src/parsers/common/error-handler.js';
+import { CommonFileProcessor, processFileCommon } from './src/parsers/common/file-processor.js';
 
 // 使用统一配置
 const CONFIG = DEFAULT_CONFIG;
@@ -102,50 +103,38 @@ function detectFileFormat(content, fileName) {
 }
 
 /**
- * 处理单个文件
+ * 处理单个文件（重构版本 - 使用公共模块）
  * @param {string} inputFile - 输入文件路径
  * @param {Object} options - 处理选项
  */
 async function processFile(inputFile, options = {}) {
   const fileName = path.basename(inputFile);
-  const fileNameWithoutExt = path.parse(fileName).name;
-
   console.log(`\n📁 处理文件: ${fileName}`);
   console.log('─'.repeat(50));
 
-  // 读取文件
-  const content = readFileContent(inputFile);
-  if (!content) {
-    return;
-  }
-
-  // 检测格式
-  const inputFormat = detectFileFormat(content, fileName);
-  console.log(`📋 检测到格式: ${inputFormat}`);
-
-  if (inputFormat === 'unknown') {
-    console.log('⚠️ 无法识别文件格式，跳过处理');
-    return;
-  }
-
-  // 创建转换器
-  const converter = new ProxyConverter();
-
   try {
-    // 解析节点
-    console.log('🔍 解析节点...');
+    // 使用公共文件处理器
+    const processor = new CommonFileProcessor({
+      enableValidation: true,
+      enableStats: true,
+      enableProgress: true
+    });
 
-    const parseFormat = getParseFormat(inputFormat);
-    const nodes = converter.parse(content, parseFormat);
-    console.log(`✅ 解析完成，共 ${nodes.length} 个节点`);
+    // 读取和检测文件
+    const content = processor.readFileContent(inputFile);
+    if (!content) return;
 
-    if (nodes.length === 0) {
-      console.log('⚠️ 没有找到有效节点');
+    const inputFormat = processor.detectFileFormat(content, fileName);
+    console.log(`📋 检测到格式: ${inputFormat}`);
+
+    if (inputFormat === 'unknown') {
+      console.log('⚠️ 无法识别文件格式，跳过处理');
       return;
     }
 
-    // 验证节点
-    validateNodes(nodes);
+    // 解析节点
+    const nodes = await processor.parseNodes(content, inputFormat);
+    if (nodes.length === 0) return;
 
     // 显示解析到的节点
     displayNodeList(nodes);
@@ -153,83 +142,22 @@ async function processFile(inputFile, options = {}) {
     // 合并处理选项
     const processOptions = { ...CONFIG.defaultOptions, ...options };
 
-    // 处理节点
-    console.log('\n🔄 处理节点...');
+    // 处理节点（去重、重命名）
+    const processedNodes = await processor.processNodes(nodes, processOptions);
 
-    // 去重
-    let processedNodes = nodes;
-    if (processOptions.deduplicate) {
-      const originalCount = processedNodes.length;
-      processedNodes = converter.deduplicate(processedNodes, processOptions.deduplicateOptions);
-      console.log(`✅ 去重完成: ${originalCount} → ${processedNodes.length} (移除 ${originalCount - processedNodes.length} 个重复)`);
-    }
-
-    // 重命名
+    // 显示重命名后的节点
     if (processOptions.rename) {
-      processedNodes = converter.rename(processedNodes, processOptions.renameOptions);
-      console.log(`✅ 重命名完成`);
-
-      // 显示重命名后的节点
       displayRenamedNodeList(processedNodes);
     }
 
-    // 生成统计信息
-    const stats = converter.getStats(processedNodes);
-    displayNodeStats(stats);
-
-    // 输出不同格式（避免重复格式转换）
-    console.log('\n💾 生成输出文件...');
-
-    // 根据输入格式决定输出格式，避免重复转换
-    const outputFormats = [];
-
-    if (inputFormat !== 'clash') {
-      // 1. Clash 格式
-      outputFormats.push({
-        name: 'Clash YAML',
-        extension: 'clash.yaml',
-        generate: async () => {
-          const { toSimpleClashYaml } = await import('./src/converters/clash.js');
-          return toSimpleClashYaml(processedNodes, { sourceFormat: inputFormat });
-        }
-      });
-    }
-
-    if (inputFormat !== 'url') {
-      // 2. URL 列表
-      outputFormats.push({
-        name: 'URL列表',
-        extension: 'urls.txt',
-        generate: () => converter.convert(processedNodes, OutputFormats.URL)
-      });
-    }
-
-    if (inputFormat !== 'base64') {
-      // 3. Base64 订阅
-      outputFormats.push({
-        name: 'Base64订阅',
-        extension: 'base64.txt',
-        generate: () => converter.convert(processedNodes, OutputFormats.BASE64)
-      });
-    }
-
-    // 4. JSON 格式（总是生成）
-    outputFormats.push({
-      name: 'JSON数据',
-      extension: 'nodes.json',
-      generate: () => JSON.stringify(converter.convert(processedNodes, OutputFormats.JSON), null, 2)
-    });
+    // 生成和显示统计信息
+    const stats = processor.generateStats(processedNodes);
+    processor.displayStats(stats);
 
     // 生成输出文件
-    for (const format of outputFormats) {
-      try {
-        const content = await format.generate();
-        const outputFile = path.join(CONFIG.outputDir, `${fileNameWithoutExt}_${format.extension}`);
-        writeFile(outputFile, content);
-      } catch (error) {
-        console.error(`❌ 生成${format.name}失败:`, error.message);
-      }
-    }
+    const fileNameWithoutExt = path.parse(fileName).name;
+    const outputFormats = [OutputFormats.CLASH, OutputFormats.URL, OutputFormats.BASE64, OutputFormats.JSON];
+    await processor.generateOutputFiles(processedNodes, outputFormats, fileNameWithoutExt, inputFormat);
 
     console.log(`✅ ${fileName} 处理完成！`);
 

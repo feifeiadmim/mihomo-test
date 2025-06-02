@@ -1,9 +1,13 @@
 /**
  * Hysteria2 协议解析器
+ * 已优化：统一错误处理、验证机制、缓存支持
  */
 
 import { ProxyTypes } from '../types.js';
 import { smartUrlDecode } from '../utils/index.js';
+import { ParserErrorHandler } from './common/error-handler.js';
+import { NodeValidator } from './common/validator.js';
+import { wrapWithCache } from './common/cache.js';
 
 // Hysteria2 协议默认配置常量
 const HYSTERIA2_DEFAULTS = {
@@ -17,17 +21,6 @@ const HYSTERIA2_DEFAULTS = {
 // 缓存正则表达式以提高性能
 const PORT_RANGE_REGEX = /@([^:/?#]+):(\d+)(?:,[\d,-]+)/;
 
-// 错误消息常量
-const ERROR_MESSAGES = {
-  INVALID_INPUT: '节点信息无效',
-  MISSING_FIELDS: '缺少必要字段',
-  INVALID_PORT: '端口无效',
-  PARSE_FAILED: '解析失败',
-  GENERATE_FAILED: '生成失败',
-  CONVERT_FAILED: '转换失败',
-  VALIDATE_FAILED: '验证失败'
-};
-
 /**
  * 验证端口号是否有效
  * @param {string|number} portStr - 端口字符串或数字
@@ -36,57 +29,6 @@ const ERROR_MESSAGES = {
 function validatePort(portStr) {
   const port = parseInt(portStr);
   return !isNaN(port) && port >= HYSTERIA2_DEFAULTS.MIN_PORT && port <= HYSTERIA2_DEFAULTS.MAX_PORT ? port : null;
-}
-
-/**
- * 验证节点基本字段
- * @param {Object} node - 节点对象
- * @returns {Object} 验证结果 {isValid, server, port, password, errors}
- */
-function validateNodeFields(node) {
-  const errors = [];
-
-  if (!node || typeof node !== 'object') {
-    return { isValid: false, errors: [ERROR_MESSAGES.INVALID_INPUT] };
-  }
-
-  const server = node.server;
-  const password = node.password || node.auth;
-  const port = validatePort(node.port);
-
-  if (!server || typeof server !== 'string') {
-    errors.push('服务器地址无效');
-  }
-
-  if (!password || typeof password !== 'string') {
-    errors.push('密码无效');
-  }
-
-  if (!port) {
-    errors.push(`${ERROR_MESSAGES.INVALID_PORT}: ${node.port}`);
-  }
-
-  return {
-    isValid: errors.length === 0,
-    server,
-    port,
-    password,
-    errors
-  };
-}
-
-/**
- * 统一的错误日志记录
- * @param {string} operation - 操作名称
- * @param {string|Array} errors - 错误信息
- * @param {Object} context - 上下文信息
- */
-function logError(operation, errors, context = {}) {
-  const errorList = Array.isArray(errors) ? errors : [errors];
-  console.error(`Hysteria2 ${operation}:`, {
-    errors: errorList,
-    ...context
-  });
 }
 
 /**
@@ -110,75 +52,96 @@ function processPortRange(url) {
 }
 
 /**
- * 解析 Hysteria2 URL
+ * 解析 Hysteria2 URL（内部实现）
  * 支持格式: hysteria2://password@server:port?params#name
  * @param {string} url - Hysteria2 URL
  * @returns {Object|null} 解析后的节点信息
  */
-export function parseHysteria2Url(url) {
-  try {
-    // 输入验证
-    if (!url || typeof url !== 'string') {
-      return null;
-    }
-
-    if (!url.startsWith('hysteria2://') && !url.startsWith('hy2://')) {
-      return null;
-    }
-
-    // 处理端口范围格式，如 32000,32000-33000
-    const processedUrl = processPortRange(url);
-    const urlObj = new URL(processedUrl);
-
-    // 提取基本信息
-    const password = smartUrlDecode(urlObj.username);
-    const server = urlObj.hostname;
-    const port = validatePort(urlObj.port);
-
-    // 验证必要字段
-    const validation = validateNodeFields({ server, port, password });
-    if (!validation.isValid) {
-      logError(ERROR_MESSAGES.PARSE_FAILED, validation.errors, {
-        url: url.substring(0, 50) + '...'
-      });
-      return null;
-    }
-
-    const name = smartUrlDecode(urlObj.hash.slice(1)) || `${server}:${port}`;
-    const params = new URLSearchParams(urlObj.search);
-
-    return {
-      type: ProxyTypes.HYSTERIA2,
-      name,
-      server,
-      port,
-      password,
-      auth: password, // Hysteria2 使用 auth 字段
-      obfs: {
-        type: params.get('obfs') || '',
-        password: params.get('obfs-password') || ''
-      },
-      tls: {
-        enabled: HYSTERIA2_DEFAULTS.TLS_ENABLED,
-        serverName: params.get('sni') || params.get('peer') || server,
-        alpn: params.get('alpn') ? params.get('alpn').split(',') : [...HYSTERIA2_DEFAULTS.ALPN],
-        skipCertVerify: params.get('insecure') === '1'
-      },
-      bandwidth: {
-        up: params.get('up') || '',
-        down: params.get('down') || ''
-      },
-      congestion: params.get('congestion') || HYSTERIA2_DEFAULTS.CONGESTION,
-      fastOpen: params.get('fastopen') === '1',
-      lazy: params.get('lazy') === '1'
-    };
-  } catch (error) {
-    logError(ERROR_MESSAGES.PARSE_FAILED, error.message, {
-      url: url ? url.substring(0, 50) + '...' : 'undefined'
-    });
-    return null;
+function _parseHysteria2Url(url) {
+  // 输入验证
+  if (!url || typeof url !== 'string') {
+    throw new Error('Invalid input: URL must be a non-empty string');
   }
+
+  if (!url.startsWith('hysteria2://') && !url.startsWith('hy2://')) {
+    throw new Error('Invalid protocol: URL must start with hysteria2:// or hy2://');
+  }
+
+  // 处理端口范围格式，如 32000,32000-33000
+  const processedUrl = processPortRange(url);
+
+  let urlObj;
+  try {
+    urlObj = new URL(processedUrl);
+  } catch (error) {
+    throw new Error(`Invalid URL format: ${error.message}`);
+  }
+
+  // 提取基本信息
+  const password = smartUrlDecode(urlObj.username);
+  const server = urlObj.hostname;
+  const port = validatePort(urlObj.port);
+
+  // 验证必要字段
+  if (!password || !server || !port) {
+    throw new Error('Missing required fields: password, server, or port');
+  }
+
+  const name = urlObj.hash ? smartUrlDecode(urlObj.hash.slice(1)) : `${server}:${port}`;
+  const params = new URLSearchParams(urlObj.search);
+
+  // 构建节点对象
+  const node = {
+    type: ProxyTypes.HYSTERIA2,
+    name,
+    server: server.trim(),
+    port,
+    password,
+    auth: password, // Hysteria2 使用 auth 字段
+    obfs: {
+      type: params.get('obfs') || '',
+      password: params.get('obfs-password') || ''
+    },
+    tls: {
+      enabled: HYSTERIA2_DEFAULTS.TLS_ENABLED,
+      serverName: params.get('sni') || params.get('peer') || server,
+      alpn: params.get('alpn') ? params.get('alpn').split(',').map(s => s.trim()) : [...HYSTERIA2_DEFAULTS.ALPN],
+      skipCertVerify: params.get('insecure') === '1'
+    },
+    bandwidth: {
+      up: params.get('up') || '',
+      down: params.get('down') || ''
+    },
+    congestion: params.get('congestion') || HYSTERIA2_DEFAULTS.CONGESTION,
+    fastOpen: params.get('fastopen') === '1',
+    lazy: params.get('lazy') === '1'
+  };
+
+  // 使用统一验证器验证节点
+  const validation = NodeValidator.validateNode(node, 'HYSTERIA2');
+  if (!validation.isValid) {
+    throw new Error(`Node validation failed: ${validation.errors.join(', ')}`);
+  }
+
+  return node;
 }
+
+/**
+ * 解析 Hysteria2 URL（带缓存和错误处理）
+ * @param {string} url - Hysteria2 URL
+ * @returns {Object|null} 解析后的节点信息
+ */
+export const parseHysteria2Url = wrapWithCache(
+  (url) => {
+    try {
+      return _parseHysteria2Url(url);
+    } catch (error) {
+      return ParserErrorHandler.handleParseError('HYSTERIA2', url, error);
+    }
+  },
+  'hysteria2',
+  { maxSize: 500, ttl: 300000 } // 5分钟缓存
+);
 
 /**
  * 生成 Hysteria2 URL
@@ -187,17 +150,14 @@ export function parseHysteria2Url(url) {
  */
 export function generateHysteria2Url(node) {
   try {
-    // 验证必要字段
-    const validation = validateNodeFields(node);
+    // 验证节点
+    const validation = NodeValidator.validateNode(node, 'HYSTERIA2');
     if (!validation.isValid) {
-      logError(ERROR_MESSAGES.GENERATE_FAILED, validation.errors, {
-        server: node?.server
-      });
-      return null;
+      throw new Error(`Invalid node: ${validation.errors.join(', ')}`);
     }
 
-    const { server, port, password } = validation;
-    const url = new URL(`hysteria2://${encodeURIComponent(password)}@${server}:${port}`);
+    const password = node.password || node.auth;
+    const url = new URL(`hysteria2://${encodeURIComponent(password)}@${node.server}:${node.port}`);
     const params = new URLSearchParams();
 
     // 混淆配置
@@ -210,7 +170,7 @@ export function generateHysteria2Url(node) {
 
     // TLS 配置
     if (node.tls) {
-      if (node.tls.serverName && node.tls.serverName !== server) {
+      if (node.tls.serverName && node.tls.serverName !== node.server) {
         params.set('sni', node.tls.serverName);
       }
       if (node.tls.alpn?.length && node.tls.alpn.join(',') !== HYSTERIA2_DEFAULTS.ALPN.join(',')) {
@@ -235,14 +195,11 @@ export function generateHysteria2Url(node) {
     if (params.toString()) {
       url.search = params.toString();
     }
-    url.hash = encodeURIComponent(node.name || `${server}:${port}`);
+    url.hash = encodeURIComponent(node.name || `${node.server}:${node.port}`);
 
     return url.toString();
   } catch (error) {
-    logError(ERROR_MESSAGES.GENERATE_FAILED, error.message, {
-      server: node?.server
-    });
-    return null;
+    return ParserErrorHandler.handleConversionError('HYSTERIA2', 'generate', node, error);
   }
 }
 
@@ -253,22 +210,18 @@ export function generateHysteria2Url(node) {
  */
 export function toClashFormat(node) {
   try {
-    // 验证必要字段
-    const validation = validateNodeFields(node);
+    // 验证节点
+    const validation = NodeValidator.validateNode(node, 'HYSTERIA2');
     if (!validation.isValid) {
-      logError(ERROR_MESSAGES.CONVERT_FAILED, validation.errors, {
-        server: node?.server
-      });
-      return null;
+      throw new Error(`Invalid node: ${validation.errors.join(', ')}`);
     }
 
-    const { server, port, password } = validation;
     const clashNode = {
-      name: node.name || `${server}:${port}`,
+      name: node.name || `${node.server}:${node.port}`,
       type: 'hysteria2',
-      server,
-      port,
-      password
+      server: node.server,
+      port: node.port,
+      password: node.password || node.auth
     };
 
     // 混淆配置
@@ -303,10 +256,7 @@ export function toClashFormat(node) {
 
     return clashNode;
   } catch (error) {
-    logError(ERROR_MESSAGES.CONVERT_FAILED, error.message, {
-      server: node?.server
-    });
-    return null;
+    return ParserErrorHandler.handleConversionError('HYSTERIA2', 'toClash', node, error);
   }
 }
 
@@ -317,36 +267,24 @@ export function toClashFormat(node) {
  */
 export function fromClashFormat(clashNode) {
   try {
-    // 验证必要字段
-    const validation = validateNodeFields({
-      server: clashNode?.server,
-      port: clashNode?.port,
-      password: clashNode?.password
-    });
-
-    if (!validation.isValid) {
-      logError(ERROR_MESSAGES.CONVERT_FAILED, validation.errors, {
-        server: clashNode?.server
-      });
-      return null;
+    if (!clashNode || typeof clashNode !== 'object') {
+      throw new Error('Invalid Clash node: must be an object');
     }
 
-    const { server, port, password } = validation;
-
-    return {
+    const node = {
       type: ProxyTypes.HYSTERIA2,
-      name: clashNode.name || `${server}:${port}`,
-      server,
-      port,
-      password,
-      auth: password,
+      name: clashNode.name || `${clashNode.server}:${clashNode.port}`,
+      server: clashNode.server,
+      port: clashNode.port,
+      password: clashNode.password,
+      auth: clashNode.password,
       obfs: {
         type: clashNode.obfs || '',
         password: clashNode['obfs-password'] || ''
       },
       tls: {
         enabled: HYSTERIA2_DEFAULTS.TLS_ENABLED,
-        serverName: clashNode.sni || server,
+        serverName: clashNode.sni || clashNode.server,
         alpn: clashNode.alpn ? [...clashNode.alpn] : [...HYSTERIA2_DEFAULTS.ALPN],
         skipCertVerify: !!clashNode['skip-cert-verify']
       },
@@ -358,32 +296,30 @@ export function fromClashFormat(clashNode) {
       fastOpen: !!clashNode['fast-open'],
       lazy: !!clashNode.lazy
     };
+
+    // 验证解析结果
+    const validation = NodeValidator.validateNode(node, 'HYSTERIA2');
+    if (!validation.isValid) {
+      throw new Error(`Node validation failed: ${validation.errors.join(', ')}`);
+    }
+
+    return node;
   } catch (error) {
-    logError(ERROR_MESSAGES.CONVERT_FAILED, error.message, {
-      server: clashNode?.server
-    });
-    return null;
+    return ParserErrorHandler.handleConversionError('HYSTERIA2', 'fromClash', clashNode, error);
   }
 }
 
 /**
- * 验证节点配置
+ * 验证节点配置（使用统一验证器）
  * @param {Object} node - 节点信息
  * @returns {boolean} 是否有效
  */
 export function validateNode(node) {
   try {
-    // 使用统一的验证函数
-    const validation = validateNodeFields(node);
-
-    // 额外验证协议类型
-    if (node?.type && node.type !== ProxyTypes.HYSTERIA2) {
-      return false;
-    }
-
+    const validation = NodeValidator.validateNode(node, 'HYSTERIA2');
     return validation.isValid;
   } catch (error) {
-    logError(ERROR_MESSAGES.VALIDATE_FAILED, error.message);
+    ParserErrorHandler.handleValidationError('HYSTERIA2', node, error.message);
     return false;
   }
 }

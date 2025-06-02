@@ -8,8 +8,29 @@ import fs from 'fs';
 import { OutputFormats } from '../types.js';
 import { ProxyConverter } from '../index.js';
 import { generateSafeFileName, validateNodes } from './common.js';
-import { FileProcessError, ConvertError, defaultErrorHandler } from './errors.js';
+import { BaseError, ParserErrorHandler } from '../parsers/common/error-handler.js';
 import { getConfig } from '../config/default.js';
+
+// 定义输出相关的错误类
+class FileProcessError extends BaseError {
+  constructor(message, filePath = null, details = null) {
+    super(message, 'FILE_PROCESS_ERROR', details);
+    this.filePath = filePath;
+  }
+}
+
+class ConvertError extends BaseError {
+  constructor(message, details = null) {
+    super(message, 'CONVERT_ERROR', details);
+  }
+}
+
+// 默认错误处理器
+const defaultErrorHandler = {
+  handle: (error) => {
+    ParserErrorHandler.logError('OUTPUT', 'file_process', error);
+  }
+};
 
 /**
  * 输出文件生成器类
@@ -20,7 +41,7 @@ export class OutputGenerator {
     this.converter = new ProxyConverter();
     this.errorHandler = options.errorHandler || defaultErrorHandler;
   }
-  
+
   /**
    * 生成多种格式的输出文件
    * @param {Object[]} nodes - 节点数组
@@ -33,22 +54,22 @@ export class OutputGenerator {
     try {
       // 验证输入参数
       validateNodes(nodes);
-      
+
       if (!Array.isArray(outputFormats) || outputFormats.length === 0) {
         throw new ConvertError('输出格式数组不能为空');
       }
-      
+
       console.log('\n💾 生成输出文件...');
-      
+
       const results = {
         success: [],
         failed: [],
         total: outputFormats.length
       };
-      
+
       // 确保输出目录存在
       this.ensureOutputDir();
-      
+
       // 生成每种格式的文件
       for (const format of outputFormats) {
         try {
@@ -65,13 +86,13 @@ export class OutputGenerator {
           console.error(`❌ 生成${errorInfo.formatName}失败: ${error.message}`);
         }
       }
-      
+
       return results;
     } catch (error) {
       throw new FileProcessError(`输出文件生成失败: ${error.message}`, null, { nodes: nodes.length, formats: outputFormats });
     }
   }
-  
+
   /**
    * 生成单一格式的输出文件
    * @param {Object[]} nodes - 节点数组
@@ -82,21 +103,21 @@ export class OutputGenerator {
    */
   async generateSingleFormat(nodes, format, filePrefix, sourceFormat) {
     const formatInfo = this.getFormatInfo(format);
-    
+
     if (!formatInfo) {
       throw new ConvertError(`不支持的输出格式: ${format}`);
     }
-    
+
     // 生成内容
     const content = await this.generateContent(nodes, format, sourceFormat);
-    
+
     // 生成安全的文件名
     const fileName = generateSafeFileName(filePrefix, formatInfo.extension);
     const outputPath = path.join(this.outputDir, fileName);
-    
+
     // 写入文件
     await this.writeFile(outputPath, content);
-    
+
     return {
       format,
       formatName: formatInfo.name,
@@ -105,7 +126,7 @@ export class OutputGenerator {
       size: Buffer.byteLength(content, 'utf8')
     };
   }
-  
+
   /**
    * 生成指定格式的内容
    * @param {Object[]} nodes - 节点数组
@@ -118,22 +139,22 @@ export class OutputGenerator {
       case OutputFormats.CLASH:
         const { toSimpleClashYaml } = await import('../converters/clash.js');
         return toSimpleClashYaml(nodes, { sourceFormat });
-        
+
       case OutputFormats.BASE64:
         return this.converter.convert(nodes, OutputFormats.BASE64);
-        
+
       case OutputFormats.URL:
         return this.converter.convert(nodes, OutputFormats.URL);
-        
+
       case OutputFormats.JSON:
         const jsonData = this.converter.convert(nodes, OutputFormats.JSON);
         return JSON.stringify(jsonData, null, 2);
-        
+
       default:
         throw new ConvertError(`不支持的输出格式: ${format}`);
     }
   }
-  
+
   /**
    * 获取格式信息
    * @param {string} format - 格式名称
@@ -141,7 +162,7 @@ export class OutputGenerator {
    */
   getFormatInfo(format) {
     const formatMap = getConfig('outputFormats', {});
-    
+
     // 标准格式映射
     const standardFormats = {
       [OutputFormats.CLASH]: { extension: 'yaml', name: 'Clash YAML' },
@@ -149,10 +170,10 @@ export class OutputGenerator {
       [OutputFormats.URL]: { extension: 'txt', name: 'URL列表' },
       [OutputFormats.JSON]: { extension: 'json', name: 'JSON数据' }
     };
-    
+
     return standardFormats[format] || formatMap[format] || null;
   }
-  
+
   /**
    * 获取格式名称
    * @param {string} format - 格式
@@ -162,21 +183,31 @@ export class OutputGenerator {
     const info = this.getFormatInfo(format);
     return info ? info.name : format;
   }
-  
+
   /**
-   * 写入文件
+   * 写入文件（使用安全写入器）
    * @param {string} filePath - 文件路径
    * @param {string} content - 文件内容
-   * @returns {Promise<void>}
+   * @returns {Promise<Object>}
    */
   async writeFile(filePath, content) {
     try {
-      await fs.promises.writeFile(filePath, content, 'utf8');
+      // 导入安全写入器
+      const { writeFileSafe } = await import('./safe-file-writer.js');
+
+      // 使用安全写入器进行原子性写入
+      const result = await writeFileSafe(filePath, content, {
+        enableBackup: false,
+        enableIntegrityCheck: true,
+        lockTimeout: 30000
+      });
+
+      return result;
     } catch (error) {
-      throw new FileProcessError(`文件写入失败: ${error.message}`, filePath);
+      throw new FileProcessError(`安全文件写入失败: ${error.message}`, filePath);
     }
   }
-  
+
   /**
    * 确保输出目录存在
    */
@@ -189,7 +220,7 @@ export class OutputGenerator {
       throw new FileProcessError(`创建输出目录失败: ${error.message}`, this.outputDir);
     }
   }
-  
+
   /**
    * 获取输出文件统计信息
    * @param {string} outputDir - 输出目录
@@ -200,34 +231,34 @@ export class OutputGenerator {
       if (!fs.existsSync(outputDir)) {
         return { totalFiles: 0, totalSize: 0, files: [] };
       }
-      
+
       const files = fs.readdirSync(outputDir);
       const stats = {
         totalFiles: files.length,
         totalSize: 0,
         files: []
       };
-      
+
       for (const file of files) {
         const filePath = path.join(outputDir, file);
         const fileStat = fs.statSync(filePath);
-        
+
         stats.files.push({
           name: file,
           size: fileStat.size,
           modified: fileStat.mtime
         });
-        
+
         stats.totalSize += fileStat.size;
       }
-      
+
       return stats;
     } catch (error) {
       this.errorHandler.handle(new FileProcessError(`获取输出统计失败: ${error.message}`, outputDir));
       return { totalFiles: 0, totalSize: 0, files: [] };
     }
   }
-  
+
   /**
    * 清理输出目录
    * @param {string} pattern - 文件名模式（可选）
@@ -238,10 +269,10 @@ export class OutputGenerator {
       if (!fs.existsSync(this.outputDir)) {
         return 0;
       }
-      
+
       const files = fs.readdirSync(this.outputDir);
       let deletedCount = 0;
-      
+
       for (const file of files) {
         if (!pattern || file.includes(pattern)) {
           const filePath = path.join(this.outputDir, file);
@@ -249,7 +280,7 @@ export class OutputGenerator {
           deletedCount++;
         }
       }
-      
+
       return deletedCount;
     } catch (error) {
       throw new FileProcessError(`清理输出目录失败: ${error.message}`, this.outputDir);
